@@ -72,20 +72,20 @@ opkg install curl bash coreutils-wc coreutils-tail sed grep
 
 ### 方式 A：通过 cURL 直接下载
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>/main/cf-ddns.sh -o cf-ddns.sh
+curl -fsSL https://raw.githubusercontent.com/fxxkmkd/cf-ddns/main/cf-ddns.sh -o cf-ddns.sh
 chmod +x cf-ddns.sh
 ```
 
 ### 方式 B：通过 Wget 下载
 ```bash
-wget -qO cf-ddns.sh https://raw.githubusercontent.com/<你的用户名>/<你的仓库名>/main/cf-ddns.sh
+wget -qO cf-ddns.sh https://raw.githubusercontent.com/fxxkmkd/cf-ddns/main/cf-ddns.sh
 chmod +x cf-ddns.sh
 ```
 
 ### 方式 C：通过 Git 仓库克隆
 ```bash
-git clone https://github.com/<你的用户名>/<你的仓库名>.git
-cd <你的仓库名>
+git clone https://github.com/fxxkmkd/cf-ddns.git
+cd cf-ddns
 chmod +x cf-ddns.sh
 ```
 
