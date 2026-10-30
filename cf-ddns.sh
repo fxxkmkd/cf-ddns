@@ -28,6 +28,16 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
+# 按任意键返回提示
+pause_return() {
+    echo ""
+    echo -ne "${YELLOW}按任意键返回菜单...${RESET}"
+    if ! read -r -n 1 -s _; then
+        read -r _
+    fi
+    echo ""
+}
+
 # 写入日志 (自动保留最近200行)
 log_msg() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $1"
@@ -89,9 +99,87 @@ get_public_ip() {
     echo "$ip"
 }
 
-# 交互式配置向导 (仅需邮箱、域名、Token)
+# 验证配置信息并保存 (供初次配置与单项修改共用)
+verify_and_save_config() {
+    local v_email="$1"
+    local v_domain="$2"
+    local v_token="$3"
+    local v_type="$4"
+    local v_proxy="$5"
+
+    CF_EMAIL="$v_email"
+    CF_TOKEN="$v_token"
+    AUTH_MODE="Bearer"
+
+    echo -e "${YELLOW}正在通过 Token 自动验证并定位域名信息...${RESET}"
+
+    # 验证新版 Bearer Token 是否有效，若无效则尝试 Email + Global Key 兼容模式
+    local test_resp
+    test_resp=$(cf_api "GET" "/zones?per_page=1")
+    if ! echo "$test_resp" | grep -q '"success":true'; then
+        AUTH_MODE="Key"
+        test_resp=$(cf_api "GET" "/zones?per_page=1")
+        if ! echo "$test_resp" | grep -q '"success":true'; then
+            echo -e "${RED}验证失败！请检查邮箱或 Token 是否正确，或是否包含 DNS 编辑权限。${RESET}"
+            return 1
+        fi
+    fi
+
+    # 自动从完整域名逐级向上匹配所属主域名，免去手动输入 Zone ID
+    local candidate="$v_domain"
+    local zone_id=""
+    local zone_name=""
+    local zone_resp
+
+    while [ "${candidate#*.}" != "$candidate" ]; do
+        zone_resp=$(cf_api "GET" "/zones?name=${candidate}")
+        zone_id=$(echo "$zone_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+        if [ -n "$zone_id" ]; then
+            zone_name="$candidate"
+            break
+        fi
+        candidate="${candidate#*.}"
+    done
+
+    if [ -z "$zone_id" ]; then
+        echo -e "${RED}未能自动匹配到域名 ${v_domain} 所属的站点，请确认该域名已托管在当前 Cloudflare 账号或 Token 权限范围内！${RESET}"
+        return 1
+    fi
+
+    # 自动查询现有解析记录 ID
+    local record_resp record_id
+    record_resp=$(cf_api "GET" "/zones/${zone_id}/dns_records?type=${v_type}&name=${v_domain}")
+    record_id=$(echo "$record_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+
+    cat > "$CONFIG_FILE" <<EOF
+CF_EMAIL="${v_email}"
+CF_TOKEN="${v_token}"
+AUTH_MODE="${AUTH_MODE}"
+ZONE_NAME="${zone_name}"
+ZONE_ID="${zone_id}"
+RECORD_NAME="${v_domain}"
+RECORD_TYPE="${v_type}"
+RECORD_ID="${record_id}"
+PROXIED="${v_proxy}"
+EOF
+    chmod 600 "$CONFIG_FILE"
+    rm -f "$IP_CACHE_FILE"
+
+    echo -e "${GREEN}验证成功！已自动绑定主域名: ${zone_name}${RESET}"
+    if [ -n "$record_id" ]; then
+        echo -e "${GREEN}已自动关联现有 ${v_type} 记录: ${v_domain}${RESET}"
+    else
+        echo -e "${YELLOW}当前尚无 ${v_domain} (${v_type}) 记录，将在同步时自动创建。${RESET}"
+    fi
+
+    # 立即执行一次同步
+    update_ddns "interactive"
+    return 0
+}
+
+# 交互式全新配置向导
 configure_ddns() {
-    echo -e "\n${CYAN}--- 配置 Cloudflare DDNS (免 Zone ID 新模式) ---${RESET}"
+    echo -e "\n${CYAN}--- 初次配置 Cloudflare DDNS (免 Zone ID 新模式) ---${RESET}"
     read -rp "1. 请输入 Cloudflare 邮箱: " input_email
     read -rp "2. 请输入 DDNS 域名 (如 ddns.example.com): " input_domain
     read -rp "3. 请输入 Cloudflare API Token: " input_token
@@ -111,70 +199,120 @@ configure_ddns() {
     read -rp "是否开启小黄云 CDN 代理 [1: 关闭(默认) / 2: 开启]: " proxy_choice
     [ "$proxy_choice" = "2" ] && input_proxy="true" || input_proxy="false"
 
-    CF_EMAIL="$input_email"
-    CF_TOKEN="$input_token"
-    AUTH_MODE="Bearer"
+    verify_and_save_config "$input_email" "$input_domain" "$input_token" "$input_type" "$input_proxy"
+}
 
-    echo -e "${YELLOW}正在通过 Token 自动验证并定位域名信息...${RESET}"
-
-    # 验证新版 Bearer Token 是否有效，若无效则尝试 Email + Global Key 兼容模式
-    test_resp=$(cf_api "GET" "/zones?per_page=1")
-    if ! echo "$test_resp" | grep -q '"success":true'; then
-        AUTH_MODE="Key"
-        test_resp=$(cf_api "GET" "/zones?per_page=1")
-        if ! echo "$test_resp" | grep -q '"success":true'; then
-            echo -e "${RED}验证失败！请检查 Token 是否正确，或是否包含 DNS 编辑权限。${RESET}"
-            return 1
-        fi
-    fi
-
-    # 自动从完整域名逐级向上匹配所属主域名，免去手动输入 Zone ID
-    local candidate="$input_domain"
-    local zone_id=""
-    local zone_name=""
-
-    while [ "${candidate#*.}" != "$candidate" ]; do
-        zone_resp=$(cf_api "GET" "/zones?name=${candidate}")
-        zone_id=$(echo "$zone_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
-        if [ -n "$zone_id" ]; then
-            zone_name="$candidate"
-            break
-        fi
-        candidate="${candidate#*.}"
-    done
-
-    if [ -z "$zone_id" ]; then
-        echo -e "${RED}未能自动匹配到域名 ${input_domain} 所属的站点，请确认该域名已托管在当前 Cloudflare 账号或 Token 权限范围内！${RESET}"
+# 二级菜单：按需修改现有配置
+modify_config_menu() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "\n${RED}当前尚未配置 DDNS，请先在主菜单选择 [1] 完成初次配置！${RESET}"
+        pause_return
         return 1
     fi
 
-    # 自动查询现有解析记录 ID
-    record_resp=$(cf_api "GET" "/zones/${zone_id}/dns_records?type=${input_type}&name=${input_domain}")
-    record_id=$(echo "$record_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+    while true; do
+        # shellcheck source=/dev/null
+        . "$CONFIG_FILE"
 
-    cat > "$CONFIG_FILE" <<EOF
-CF_EMAIL="${input_email}"
-CF_TOKEN="${input_token}"
-AUTH_MODE="${AUTH_MODE}"
-ZONE_NAME="${zone_name}"
-ZONE_ID="${zone_id}"
-RECORD_NAME="${input_domain}"
-RECORD_TYPE="${input_type}"
-RECORD_ID="${record_id}"
-PROXIED="${input_proxy}"
-EOF
-    chmod 600 "$CONFIG_FILE"
-    rm -f "$IP_CACHE_FILE"
+        local proxy_status_str
+        if [ "$PROXIED" = "true" ]; then
+            proxy_status_str="${GREEN}开启 (true)${RESET}"
+        else
+            proxy_status_str="${YELLOW}关闭 (false)${RESET}"
+        fi
 
-    echo -e "${GREEN}验证成功！已自动绑定主域名: ${zone_name}${RESET}"
-    if [ -n "$record_id" ]; then
-        echo -e "${GREEN}已自动关联现有 ${input_type} 记录: ${input_domain}${RESET}"
-    else
-        echo -e "${YELLOW}当前尚无 ${input_domain} 记录，将在首次同步时自动创建。${RESET}"
-    fi
+        local masked_token="已配置"
+        if [ ${#CF_TOKEN} -gt 8 ]; then
+            masked_token="${CF_TOKEN:0:4}****${CF_TOKEN: -4}"
+        fi
 
-    # 配置完成后立即执行一次同步
-    update_ddns "interactive"
+        echo -e "\n${CYAN}=========================================${RESET}"
+        echo -e "${CYAN}          修改 DDNS 配置 (二级菜单)      ${RESET}"
+        echo -e "${CYAN}=========================================${RESET}"
+        echo -e "  1. 修改 Cloudflare 邮箱  [当前: ${YELLOW}${CF_EMAIL}${RESET}]"
+        echo -e "  2. 修改 DDNS 域名        [当前: ${GREEN}${RECORD_NAME}${RESET}]"
+        echo -e "  3. 修改 API Token        [当前: ${YELLOW}${masked_token}${RESET}]"
+        echo -e "  4. 切换解析类型 (A/AAAA) [当前: ${CYAN}${RECORD_TYPE}${RESET}]"
+        echo -e "  5. 切换小黄云 CDN 开关   [当前: ${proxy_status_str}]"
+        echo -e "  0. 返回主菜单"
+        echo -e "${CYAN}=========================================${RESET}"
+        read -rp "请输入要修改的选项 [0-5]: " sub_choice
+
+        case "$sub_choice" in
+            1)
+                read -rp "请输入新的 Cloudflare 邮箱: " new_email
+                new_email=$(echo "$new_email" | tr -d '[:space:]')
+                if [ -z "$new_email" ]; then
+                    echo -e "${RED}邮箱不能为空，已取消修改！${RESET}"
+                else
+                    verify_and_save_config "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
+                fi
+                pause_return
+                ;;
+            2)
+                read -rp "请输入新的 DDNS 域名 (如 ddns.example.com): " new_domain
+                new_domain=$(echo "$new_domain" | tr -d '[:space:]')
+                if [ -z "$new_domain" ]; then
+                    echo -e "${RED}域名不能为空，已取消修改！${RESET}"
+                else
+                    verify_and_save_config "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
+                fi
+                pause_return
+                ;;
+            3)
+                read -rp "请输入新的 Cloudflare API Token: " new_token
+                new_token=$(echo "$new_token" | tr -d '[:space:]')
+                if [ -z "$new_token" ]; then
+                    echo -e "${RED}Token 不能为空，已取消修改！${RESET}"
+                else
+                    verify_and_save_config "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
+                fi
+                pause_return
+                ;;
+            4)
+                echo -e "当前解析类型为: ${CYAN}${RECORD_TYPE}${RESET}"
+                read -rp "请选择新的解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_choice
+                local new_type
+                if [ "$new_type_choice" = "1" ]; then
+                    new_type="A"
+                elif [ "$new_type_choice" = "2" ]; then
+                    new_type="AAAA"
+                else
+                    echo -e "${RED}输入无效，已取消修改！${RESET}"
+                    pause_return
+                    continue
+                fi
+                verify_and_save_config "$CF_EMAIL" "$RECORD_NAME" "$CF_TOKEN" "$new_type" "$PROXIED"
+                pause_return
+                ;;
+            5)
+                echo -e "当前小黄云 CDN 状态为: ${proxy_status_str}"
+                read -rp "请选择小黄云状态 [1: 关闭(false) / 2: 开启(true)]: " new_proxy_choice
+                local new_proxy
+                if [ "$new_proxy_choice" = "1" ]; then
+                    new_proxy="false"
+                elif [ "$new_proxy_choice" = "2" ]; then
+                    new_proxy="true"
+                else
+                    echo -e "${RED}输入无效，已取消修改！${RESET}"
+                    pause_return
+                    continue
+                fi
+                sed -i "s/^PROXIED=.*/PROXIED=\"${new_proxy}\"/" "$CONFIG_FILE"
+                rm -f "$IP_CACHE_FILE"
+                echo -e "${GREEN}小黄云状态已更新为: ${new_proxy}，正在同步至 Cloudflare...${RESET}"
+                update_ddns "interactive"
+                pause_return
+                ;;
+            0)
+                break
+                ;;
+            *)
+                echo -e "${RED}无效选项，请重新输入！${RESET}"
+                pause_return
+                ;;
+        esac
+    done
 }
 
 # 核心更新逻辑
@@ -231,8 +369,8 @@ update_ddns() {
             sed -i "s/^RECORD_ID=.*/RECORD_ID=\"${new_id}\"/" "$CONFIG_FILE"
         fi
         echo "$current_ip" > "$IP_CACHE_FILE"
-        log_msg "更新成功: ${RECORD_NAME} (${RECORD_TYPE}) -> ${current_ip}"
-        [ "$mode" = "interactive" ] && echo -e "${GREEN}DDNS 更新成功！${RECORD_NAME} -> ${current_ip}${RESET}"
+        log_msg "更新成功: ${RECORD_NAME} (${RECORD_TYPE}) -> ${current_ip} (Proxied: ${PROXIED})"
+        [ "$mode" = "interactive" ] && echo -e "${GREEN}DDNS 更新成功！${RECORD_NAME} -> ${current_ip} (小黄云: ${PROXIED})${RESET}"
     else
         log_msg "更新失败: ${update_resp}"
         [ "$mode" = "interactive" ] && echo -e "${RED}更新失败，返回信息: ${update_resp}${RESET}"
@@ -390,6 +528,30 @@ show_status() {
     fi
 }
 
+# 卸载脚本与清理所有数据
+uninstall_ddns() {
+    echo -e "\n${RED}=================== 警告 ===================${RESET}"
+    echo -e "${YELLOW}即将彻底卸载 Cloudflare DDNS 脚本！该操作将：${RESET}"
+    echo "  1. 停止并移除后台定时任务与开机自启服务"
+    echo "  2. 删除所有配置文件、IP缓存与运行日志 ($CONFIG_DIR)"
+    echo "  3. 删除当前脚本文件自身 ($SCRIPT_PATH)"
+    echo -e "${RED}============================================${RESET}"
+    read -rp "确认要彻底卸载吗？[y/N]: " confirm_uninst
+
+    case "$confirm_uninst" in
+        [yY][eE][sS]|[yY])
+            stop_timer "quiet"
+            rm -rf "$CONFIG_DIR"
+            rm -f "$SCRIPT_PATH"
+            echo -e "${GREEN}卸载完成！所有服务、配置及脚本文件均已彻底清除。${RESET}"
+            exit 0
+            ;;
+        *)
+            echo -e "${CYAN}已取消卸载操作。${RESET}"
+            ;;
+    esac
+}
+
 # 后台守护调用入口
 if [ "$1" = "--daemon" ]; then
     run_daemon "$2"
@@ -401,22 +563,26 @@ while true; do
     echo -e "\n${CYAN}=========================================${RESET}"
     echo -e "${CYAN}     Cloudflare 轻量级 DDNS 管理脚本     ${RESET}"
     echo -e "${CYAN}=========================================${RESET}"
-    echo "  1. 配置 DDNS (仅需邮箱 + 域名 + Token)"
-    echo "  2. 立即执行一次 DDNS 同步 (测试/强制刷新)"
-    echo "  3. 开启 / 修改后台定时任务 (按秒设置)"
-    echo "  4. 停止后台定时任务"
-    echo "  5. 查看当前状态与运行日志"
+    echo "  1. 初次配置 DDNS (仅需邮箱 + 域名 + Token)"
+    echo "  2. 修改现有配置 (邮箱/域名/Token/小黄云等)"
+    echo "  3. 立即执行一次 DDNS 同步 (测试/强制刷新)"
+    echo "  4. 开启 / 修改后台定时任务 (按秒设置)"
+    echo "  5. 停止后台定时任务"
+    echo "  6. 查看当前状态与运行日志"
+    echo "  7. 彻底卸载脚本 (停止服务并清除所有文件)"
     echo "  0. 退出脚本"
     echo -e "${CYAN}=========================================${RESET}"
-    read -rp "请输入数字选择功能 [0-5]: " choice
+    read -rp "请输入数字选择功能 [0-7]: " choice
 
     case "$choice" in
-        1) configure_ddns ;;
-        2) update_ddns "interactive" ;;
-        3) setup_timer ;;
-        4) stop_timer ;;
-        5) show_status ;;
+        1) configure_ddns; pause_return ;;
+        2) modify_config_menu ;;
+        3) update_ddns "interactive"; pause_return ;;
+        4) setup_timer; pause_return ;;
+        5) stop_timer; pause_return ;;
+        6) show_status; pause_return ;;
+        7) uninstall_ddns; pause_return ;;
         0) echo "已退出。"; exit 0 ;;
-        *) echo -e "${RED}无效选项，请重新输入！${RESET}" ;;
+        *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
     esac
 done
