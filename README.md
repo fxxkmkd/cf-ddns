@@ -1,4 +1,4 @@
-# Cloudflare 轻量级 DDNS 脚本 (cf-ddns)
+# Cloudflare 轻量级 DDNS 脚本 
 
 一个轻量、无需手动查找 Zone ID 的 Cloudflare 动态域名解析 (DDNS) 自动化脚本。仅需提供邮箱、域名和 API Token，脚本即可自动追溯 Zone 匹配所属站点并同步更新 DNS 记录。支持精确到秒级的后台守护进程、系统级开机自启、多级子域名以及 IPv4 / IPv6 双栈支持。
 
