@@ -1,12 +1,31 @@
 #!/usr/bin/env bash
 # ====================================================
-# Cloudflare 轻量级 DDNS 脚本 (免 ZoneID / 仅需邮箱+域名+Token / 按秒定时)
+# 多平台轻量级 DDNS 脚本 (Cloudflare 纯Shell极速版 & 华为云 TTL=1 | 国内外双栈IP源)
 # ====================================================
+
+# 若用户使用 sh 启动，自动无缝切换至 bash 执行，防止语法报错
+if [ -z "${BASH_VERSION:-}" ]; then
+    exec /usr/bin/env bash "$0" "$@"
+fi
 
 # 确保 HOME 变量在 Systemd 或特殊环境下始终有效
 if [ -z "$HOME" ] || [ "$HOME" = "/" ]; then
     HOME=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
     [ -z "$HOME" ] && HOME="/root"
+fi
+
+SERVICE_FILE="/etc/systemd/system/cf-ddns.service"
+
+# 防止前后权限不一致导致配置目录分裂：若 Systemd 服务已存在且当前用户有权限读写，优先沿用其配置目录
+if [ -z "${CONFIG_DIR:-}" ] && [ -f "$SERVICE_FILE" ]; then
+    _svc_dir=$(grep '^Environment="CONFIG_DIR=' "$SERVICE_FILE" 2>/dev/null | head -n 1 | cut -d'=' -f3 | tr -d '"')
+    if [ -n "$_svc_dir" ]; then
+        if [ -w "$_svc_dir" ] || [ "$(id -u)" -eq 0 ]; then
+            CONFIG_DIR="$_svc_dir"
+        else
+            echo -e "\033[33m提示：检测到系统已安装 root 级后台服务，建议使用 sudo 或 root 权限运行本脚本以保持配置同步！\033[0m"
+        fi
+    fi
 fi
 
 CONFIG_DIR="${CONFIG_DIR:-$HOME/.cf_ddns}"
@@ -17,9 +36,8 @@ IP_CACHE_FILE="$CONFIG_DIR/last_ip.txt"
 LAST_CHECK_FILE="$CONFIG_DIR/last_check.txt"
 PID_FILE="$CONFIG_DIR/ddns.pid"
 SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-SERVICE_FILE="/etc/systemd/system/cf-ddns.service"
 
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" 2>/dev/null
 
 # 颜色定义
 GREEN="\033[32m"
@@ -28,14 +46,110 @@ YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
 
-# 按任意键返回提示
+# 按需检测并自动安装缺失环境 (保持 Cloudflare 纯净轻量，仅在需要时安装对应依赖)
+ensure_dependencies() {
+    local missing_pkgs=()
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing_pkgs+=("$cmd")
+    done
+
+    if [ ${#missing_pkgs[@]} -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}检测到系统缺少必要组件: ${missing_pkgs[*]}，正在尝试自动安装...${RESET}"
+
+    local pm=""
+    if command -v apt-get >/dev/null 2>&1; then
+        pm="apt"
+    elif command -v dnf >/dev/null 2>&1; then
+        pm="dnf"
+    elif command -v yum >/dev/null 2>&1; then
+        pm="yum"
+    elif command -v pacman >/dev/null 2>&1; then
+        pm="pacman"
+    elif command -v apk >/dev/null 2>&1; then
+        pm="apk"
+    elif command -v opkg >/dev/null 2>&1; then
+        pm="opkg"
+    fi
+
+    if [ -z "$pm" ]; then
+        echo -e "${RED}未找到支持的包管理器，请手动安装: ${missing_pkgs[*]}${RESET}"
+        return 1
+    fi
+
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+        else
+            echo -e "${RED}当前非 root 用户且未安装 sudo，无法自动安装: ${missing_pkgs[*]}${RESET}"
+            return 1
+        fi
+    fi
+
+    case "$pm" in
+        apt)
+            $SUDO apt-get update -y >/dev/null 2>&1
+            $SUDO apt-get install -y "${missing_pkgs[@]}" >/dev/null 2>&1
+            ;;
+        dnf)
+            $SUDO dnf install -y "${missing_pkgs[@]}" >/dev/null 2>&1
+            ;;
+        yum)
+            $SUDO yum install -y "${missing_pkgs[@]}" >/dev/null 2>&1
+            ;;
+        pacman)
+            $SUDO pacman -Sy --noconfirm "${missing_pkgs[@]}" >/dev/null 2>&1
+            ;;
+        apk)
+            $SUDO apk update >/dev/null 2>&1
+            $SUDO apk add --no-cache "${missing_pkgs[@]}" >/dev/null 2>&1
+            ;;
+        opkg)
+            $SUDO opkg update >/dev/null 2>&1
+            $SUDO opkg install "${missing_pkgs[@]}" >/dev/null 2>&1
+            if [[ " ${missing_pkgs[*]} " == *" python3 "* ]]; then
+                $SUDO opkg install python3-urllib python3-openssl >/dev/null 2>&1
+            fi
+            ;;
+    esac
+
+    local failed=()
+    for pkg in "${missing_pkgs[@]}"; do
+        command -v "$pkg" >/dev/null 2>&1 || failed+=("$pkg")
+    done
+
+    if [ ${#failed[@]} -gt 0 ]; then
+        echo -e "${RED}组件安装失败: ${failed[*]}，请检查网络源或手动安装！${RESET}"
+        return 1
+    else
+        echo -e "${GREEN}组件 ${missing_pkgs[*]} 已自动安装就绪！${RESET}"
+        return 0
+    fi
+}
+
+# 按任意键返回 (清空输入缓冲区，防止方向键或回车符漏入主菜单)
 pause_return() {
     echo ""
     echo -ne "${YELLOW}按任意键返回菜单...${RESET}"
     if ! read -r -n 1 -s _; then
         read -r _
     fi
+    read -r -t 0.1 -n 10000 _ 2>/dev/null || true
     echo ""
+}
+
+# 唤醒正在休眠的后台守护进程 (使配置修改立即生效)
+wakeup_daemon() {
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid=$(tr -cd '0-9' < "$PID_FILE")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            pkill -P "$pid" sleep 2>/dev/null || true
+        fi
+    fi
 }
 
 # 写入日志 (自动保留最近200行)
@@ -47,7 +161,78 @@ log_msg() {
     fi
 }
 
-# 统一封装 Cloudflare API 请求 (自动兼容新版 Bearer Token 与 Email+Key)
+# 纯 Bash 内置零开销校验 IPv4 / IPv6 合法性 (不启动任何外部进程，保护超低配 VPS)
+is_valid_ip() {
+    local ip_str="$1"
+    local ip_type="$2"
+    [ -z "$ip_str" ] && return 1
+
+    if [ "$ip_type" = "AAAA" ]; then
+        # 合法 IPv6 至少包含两个冒号，且仅由十六进制字符与冒号组成
+        if [[ "$ip_str" == *:*:* ]] && [[ "$ip_str" =~ ^[0-9a-fA-F:]+$ ]]; then
+            return 0
+        fi
+        return 1
+    else
+        if [[ "$ip_str" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+            local i
+            for i in 1 2 3 4; do
+                if [ "${BASH_REMATCH[$i]}" -gt 255 ]; then
+                    return 1
+                fi
+            done
+            return 0
+        fi
+        return 1
+    fi
+}
+
+# 获取本机公网 IP (国际纯文本源优先 -> 失败自动切换国内纯文本源)
+get_public_ip() {
+    local type="$1"
+    local ip=""
+
+    if [ "$type" = "AAAA" ]; then
+        # 1. 国际 IPv6 检测源
+        for url in "https://ipv6.icanhazip.com" "https://api6.ipify.org" "https://v6.ident.me"; do
+            ip=$(curl -s -6 --max-time 3 "$url" | tr -d '[:space:]')
+            if is_valid_ip "$ip" "AAAA"; then
+                echo "$ip"
+                return 0
+            fi
+        done
+        # 2. 国内 IPv6 检测源兜底
+        for url in "https://6.ipw.cn" "https://v6.myip.la" "https://speed.neu6.edu.cn/getIP.php"; do
+            ip=$(curl -s -6 --max-time 4 "$url" | tr -d '[:space:]')
+            if is_valid_ip "$ip" "AAAA"; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    else
+        # 1. 国际 IPv4 检测源
+        for url in "https://ipv4.icanhazip.com" "https://api.ipify.org" "https://ident.me"; do
+            ip=$(curl -s -4 --max-time 3 "$url" | tr -d '[:space:]')
+            if is_valid_ip "$ip" "A"; then
+                echo "$ip"
+                return 0
+            fi
+        done
+        # 2. 国内 IPv4 纯文本检测源兜底 (不做模糊 HTML 提取，防止把网关错误码当成 IP)
+        for url in "https://4.ipw.cn" "https://ip.3322.net" "https://v4.myip.la"; do
+            ip=$(curl -s -4 --max-time 4 "$url" | tr -d '[:space:]')
+            if is_valid_ip "$ip" "A"; then
+                echo "$ip"
+                return 0
+            fi
+        done
+    fi
+
+    echo ""
+    return 1
+}
+
+# ==================== Cloudflare 专用模块 (纯 Shell 物理隔离) ====================
 cf_api() {
     local method="$1"
     local endpoint="$2"
@@ -81,26 +266,7 @@ cf_api() {
     fi
 }
 
-# 获取本机公网 IP
-get_public_ip() {
-    local type="$1"
-    local ip=""
-    if [ "$type" = "AAAA" ]; then
-        for url in "https://ipv6.icanhazip.com" "https://api6.ipify.org" "https://v6.ident.me"; do
-            ip=$(curl -s -6 --max-time 4 "$url" | tr -d '[:space:]')
-            [ -n "$ip" ] && break
-        done
-    else
-        for url in "https://ipv4.icanhazip.com" "https://api.ipify.org" "https://ident.me"; do
-            ip=$(curl -s -4 --max-time 4 "$url" | tr -d '[:space:]')
-            [ -n "$ip" ] && break
-        done
-    fi
-    echo "$ip"
-}
-
-# 验证配置信息并保存 (供初次配置与单项修改共用)
-verify_and_save_config() {
+verify_and_save_cf() {
     local v_email="$1"
     local v_domain="$2"
     local v_token="$3"
@@ -111,47 +277,52 @@ verify_and_save_config() {
     CF_TOKEN="$v_token"
     AUTH_MODE="Bearer"
 
-    echo -e "${YELLOW}正在通过 Token 自动验证并定位域名信息...${RESET}"
-
-    # 验证新版 Bearer Token 是否有效，若无效则尝试 Email + Global Key 兼容模式
+    echo -e "${YELLOW}正在通过 Token 验证 Cloudflare 权限...${RESET}"
     local test_resp
     test_resp=$(cf_api "GET" "/zones?per_page=1")
     if ! echo "$test_resp" | grep -q '"success":true'; then
         AUTH_MODE="Key"
         test_resp=$(cf_api "GET" "/zones?per_page=1")
         if ! echo "$test_resp" | grep -q '"success":true'; then
-            echo -e "${RED}验证失败！请检查邮箱或 Token 是否正确，或是否包含 DNS 编辑权限。${RESET}"
+            echo -e "${RED}验证失败！请检查邮箱或 Token 是否正确，或是否具备 DNS 编辑权限。${RESET}"
             return 1
         fi
     fi
 
-    # 自动从完整域名逐级向上匹配所属主域名，免去手动输入 Zone ID
     local candidate="$v_domain"
     local zone_id=""
     local zone_name=""
     local zone_resp
 
-    while [ "${candidate#*.}" != "$candidate" ]; do
+    while true; do
         zone_resp=$(cf_api "GET" "/zones?name=${candidate}")
-        zone_id=$(echo "$zone_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
-        if [ -n "$zone_id" ]; then
-            zone_name="$candidate"
+        if echo "$zone_resp" | grep -q '"success":true'; then
+            zone_id=$(echo "$zone_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+            if [ -n "$zone_id" ]; then
+                zone_name="$candidate"
+                break
+            fi
+        fi
+        local next_cand="${candidate#*.}"
+        if [ "$next_cand" = "$candidate" ] || [[ "$next_cand" != *.* ]]; then
             break
         fi
-        candidate="${candidate#*.}"
+        candidate="$next_cand"
     done
 
     if [ -z "$zone_id" ]; then
-        echo -e "${RED}未能自动匹配到域名 ${v_domain} 所属的站点，请确认该域名已托管在当前 Cloudflare 账号或 Token 权限范围内！${RESET}"
+        echo -e "${RED}未能自动匹配到域名 ${v_domain} 所属的站点，请确认该域名已托管在当前 Cloudflare 账号下！${RESET}"
         return 1
     fi
 
-    # 自动查询现有解析记录 ID
-    local record_resp record_id
+    local record_resp record_id=""
     record_resp=$(cf_api "GET" "/zones/${zone_id}/dns_records?type=${v_type}&name=${v_domain}")
-    record_id=$(echo "$record_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+    if echo "$record_resp" | grep -q '"success":true'; then
+        record_id=$(echo "$record_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+    fi
 
     cat > "$CONFIG_FILE" <<EOF
+PROVIDER="cloudflare"
 CF_EMAIL="${v_email}"
 CF_TOKEN="${v_token}"
 AUTH_MODE="${AUTH_MODE}"
@@ -164,48 +335,234 @@ PROXIED="${v_proxy}"
 EOF
     chmod 600 "$CONFIG_FILE"
     rm -f "$IP_CACHE_FILE"
-
-    echo -e "${GREEN}验证成功！已自动绑定主域名: ${zone_name}${RESET}"
-    if [ -n "$record_id" ]; then
-        echo -e "${GREEN}已自动关联现有 ${v_type} 记录: ${v_domain}${RESET}"
-    else
-        echo -e "${YELLOW}当前尚无 ${v_domain} (${v_type}) 记录，将在同步时自动创建。${RESET}"
-    fi
-
-    # 立即执行一次同步
+    echo -e "${GREEN}验证成功！已自动绑定 Cloudflare 主域名: ${zone_name}${RESET}"
     update_ddns "interactive"
+    wakeup_daemon
     return 0
 }
 
-# 交互式全新配置向导
-configure_ddns() {
-    echo -e "\n${CYAN}--- 初次配置 Cloudflare DDNS (免 Zone ID 新模式) ---${RESET}"
-    read -rp "1. 请输入 Cloudflare 邮箱: " input_email
-    read -rp "2. 请输入 DDNS 域名 (如 ddns.example.com): " input_domain
-    read -rp "3. 请输入 Cloudflare API Token: " input_token
+# ==================== 华为云 专用模块 (按需调用 Python3 签名) ====================
+hw_api() {
+    local method="$1"
+    local uri="$2"
+    local body="$3"
 
-    input_email=$(echo "$input_email" | tr -d '[:space:]')
-    input_domain=$(echo "$input_domain" | tr -d '[:space:]')
-    input_token=$(echo "$input_token" | tr -d '[:space:]')
+    python3 -c '
+import sys, hmac, hashlib, datetime, urllib.request, urllib.error, urllib.parse, json
 
-    if [ -z "$input_email" ] || [ -z "$input_domain" ] || [ -z "$input_token" ]; then
-        echo -e "${RED}错误：邮箱、域名和 Token 均不能为空！${RESET}"
+method = sys.argv[1].upper()
+raw_uri = sys.argv[2]
+body = sys.argv[3] if len(sys.argv) > 3 else ""
+ak = sys.argv[4]
+sk = sys.argv[5]
+
+host = "dns.myhuaweicloud.com"
+parsed = urllib.parse.urlsplit(raw_uri)
+path = parsed.path
+
+canonical_uri = path if path.endswith("/") else path + "/"
+
+qsl = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+qsl.sort(key=lambda x: (x[0], x[1]))
+safe_chars = "-~."
+canonical_query = "&".join(
+    urllib.parse.quote(k, safe=safe_chars) + "=" + urllib.parse.quote(v, safe=safe_chars)
+    for k, v in qsl
+)
+
+actual_uri = path + ("?" + canonical_query if canonical_query else "")
+endpoint = "https://" + host + actual_uri
+
+t = datetime.datetime.now(datetime.timezone.utc)
+sdk_date = t.strftime("%Y%m%dT%H%M%SZ")
+
+body_bytes = body.encode("utf-8")
+payload_hash = hashlib.sha256(body_bytes).hexdigest()
+
+signed_headers = "content-type;host;x-sdk-date"
+canonical_headers = f"content-type:application/json\nhost:{host}\nx-sdk-date:{sdk_date}\n"
+
+canonical_request = f"{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+req_hash = hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
+string_to_sign = f"SDK-HMAC-SHA256\n{sdk_date}\n{req_hash}"
+
+signature = hmac.new(sk.encode("utf-8"), string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
+auth_header = f"SDK-HMAC-SHA256 Access={ak}, SignedHeaders={signed_headers}, Signature={signature}"
+
+req = urllib.request.Request(endpoint, data=body_bytes if body else None, method=method)
+req.add_header("Authorization", auth_header)
+req.add_header("Host", host)
+req.add_header("X-Sdk-Date", sdk_date)
+req.add_header("Content-Type", "application/json")
+
+try:
+    with urllib.request.urlopen(req, timeout=8) as response:
+        print(response.read().decode("utf-8"))
+except urllib.error.HTTPError as e:
+    print(e.read().decode("utf-8"))
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+' "$method" "$uri" "$body" "$HW_AK" "$HW_SK"
+}
+
+hw_parse_id() {
+    local json_str="$1"
+    local list_key="$2"
+    local target_name="$3"
+    local target_type="$4"
+
+    python3 -c '
+import sys, json
+try:
+    data = json.loads(sys.argv[1])
+    key = sys.argv[2]
+    t_name = sys.argv[3]
+    t_type = sys.argv[4]
+    if key == "direct":
+        print(data.get("id", ""))
+    else:
+        for item in data.get(key, []):
+            if t_name and item.get("name") != t_name:
+                continue
+            if t_type and item.get("type") != t_type:
+                continue
+            print(item.get("id", ""))
+            break
+except Exception:
+    pass
+' "$json_str" "$list_key" "$target_name" "$target_type"
+}
+
+verify_and_save_hw() {
+    local v_ak="$1"
+    local v_sk="$2"
+    local v_domain="$3"
+    local v_type="$4"
+    local v_ttl="${5:-1}"
+
+    # 仅在使用华为云时按需检测并安装 python3
+    if ! ensure_dependencies "python3"; then
         return 1
     fi
 
-    read -rp "解析类型 [1: IPv4(默认) / 2: IPv6]: " type_choice
-    [ "$type_choice" = "2" ] && input_type="AAAA" || input_type="A"
+    HW_AK="$v_ak"
+    HW_SK="$v_sk"
 
-    read -rp "是否开启小黄云 CDN 代理 [1: 关闭(默认) / 2: 开启]: " proxy_choice
-    [ "$proxy_choice" = "2" ] && input_proxy="true" || input_proxy="false"
+    echo -e "${YELLOW}正在验证华为云 AK/SK 权限...${RESET}"
+    local test_resp
+    test_resp=$(hw_api "GET" "/v2/zones?limit=1" "")
+    if ! echo "$test_resp" | grep -q '"zones"'; then
+        echo -e "${RED}验证失败！请检查 AK/SK 是否正确，返回信息: ${test_resp}${RESET}"
+        return 1
+    fi
 
-    verify_and_save_config "$input_email" "$input_domain" "$input_token" "$input_type" "$input_proxy"
+    echo -e "${YELLOW}正在自动向上匹配华为云托管主域名...${RESET}"
+    local candidate="$v_domain"
+    local zone_id=""
+    local zone_name=""
+
+    while true; do
+        local check_name="${candidate}."
+        local resp
+        resp=$(hw_api "GET" "/v2/zones?name=${check_name}" "")
+        zone_id=$(hw_parse_id "$resp" "zones" "$check_name" "")
+        if [ -n "$zone_id" ]; then
+            zone_name="$candidate"
+            break
+        fi
+        local next_cand="${candidate#*.}"
+        if [ "$next_cand" = "$candidate" ] || [[ "$next_cand" != *.* ]]; then
+            break
+        fi
+        candidate="$next_cand"
+    done
+
+    if [ -z "$zone_id" ]; then
+        echo -e "${RED}未能自动匹配到域名 ${v_domain} 在华为云公网解析中的 Zone！请确认该域名已在华为云创建公网域名。${RESET}"
+        return 1
+    fi
+
+    local query_name="${v_domain}."
+    local record_resp record_id
+    record_resp=$(hw_api "GET" "/v2/zones/${zone_id}/recordsets?name=${query_name}&type=${v_type}" "")
+    record_id=$(hw_parse_id "$record_resp" "recordsets" "$query_name" "$v_type")
+
+    cat > "$CONFIG_FILE" <<EOF
+PROVIDER="huawei"
+HW_AK="${v_ak}"
+HW_SK="${v_sk}"
+ZONE_NAME="${zone_name}"
+ZONE_ID="${zone_id}"
+RECORD_NAME="${v_domain}"
+RECORD_TYPE="${v_type}"
+RECORD_ID="${record_id}"
+HW_TTL="${v_ttl}"
+EOF
+    chmod 600 "$CONFIG_FILE"
+    rm -f "$IP_CACHE_FILE"
+    echo -e "${GREEN}验证成功！已绑定华为云主域名: ${zone_name} (TTL: ${v_ttl}秒)${RESET}"
+    update_ddns "interactive"
+    wakeup_daemon
+    return 0
 }
 
-# 二级菜单：按需修改现有配置
+# ==================== 初次配置向导 ====================
+configure_ddns() {
+    echo -e "\n${CYAN}--- 选择 DNS 服务商 ---${RESET}"
+    echo "  1. Cloudflare (纯 Shell 超轻量模式，适合所有机型)"
+    echo "  2. 华为云 (支持 TTL=1 秒极速生效，需 Python3 环境)"
+    read -rp "请选择服务商 [1-2，默认1]: " prov_choice
+
+    if [ "$prov_choice" = "2" ]; then
+        echo -e "\n${CYAN}--- 配置 华为云 DDNS ---${RESET}"
+        read -rp "1. 请输入华为云 Access Key ID (AK): " input_ak
+        read -rp "2. 请输入华为云 Secret Access Key (SK): " input_sk
+        read -rp "3. 请输入 DDNS 域名 (如 ddns.example.com): " input_domain
+        read -rp "4. 解析类型 [1: IPv4(默认) / 2: IPv6]: " type_choice
+        [ "$type_choice" = "2" ] && input_type="AAAA" || input_type="A"
+
+        read -rp "5. 请输入 TTL 秒数 (默认 1 秒，极速生效): " input_ttl
+        input_ttl=$(echo "$input_ttl" | tr -cd '0-9')
+        input_ttl=${input_ttl:-1}
+        [ "$input_ttl" -lt 1 ] && input_ttl=1
+
+        input_ak=$(echo "$input_ak" | tr -d '[:space:]')
+        input_sk=$(echo "$input_sk" | tr -d '[:space:]')
+        input_domain=$(echo "$input_domain" | tr -d '[:space:]')
+        input_domain="${input_domain%.}"
+
+        if [ -z "$input_ak" ] || [ -z "$input_sk" ] || [ -z "$input_domain" ]; then
+            echo -e "${RED}错误：AK、SK 和域名均不能为空！${RESET}"
+            return 1
+        fi
+        verify_and_save_hw "$input_ak" "$input_sk" "$input_domain" "$input_type" "$input_ttl"
+    else
+        echo -e "\n${CYAN}--- 配置 Cloudflare DDNS ---${RESET}"
+        read -rp "1. 请输入 Cloudflare 邮箱: " input_email
+        read -rp "2. 请输入 DDNS 域名 (如 ddns.example.com): " input_domain
+        read -rp "3. 请输入 Cloudflare API Token: " input_token
+        read -rp "4. 解析类型 [1: IPv4(默认) / 2: IPv6]: " type_choice
+        [ "$type_choice" = "2" ] && input_type="AAAA" || input_type="A"
+        read -rp "5. 是否开启小黄云 CDN 代理 [1: 关闭(默认) / 2: 开启]: " proxy_choice
+        [ "$proxy_choice" = "2" ] && input_proxy="true" || input_proxy="false"
+
+        input_email=$(echo "$input_email" | tr -d '[:space:]')
+        input_domain=$(echo "$input_domain" | tr -d '[:space:]')
+        input_domain="${input_domain%.}"
+        input_token=$(echo "$input_token" | tr -d '[:space:]')
+
+        if [ -z "$input_email" ] || [ -z "$input_domain" ] || [ -z "$input_token" ]; then
+            echo -e "${RED}错误：邮箱、域名和 Token 均不能为空！${RESET}"
+            return 1
+        fi
+        verify_and_save_cf "$input_email" "$input_domain" "$input_token" "$input_type" "$input_proxy"
+    fi
+}
+
+# ==================== 二级菜单：按需修改现有配置 ====================
 modify_config_menu() {
     if [ ! -f "$CONFIG_FILE" ]; then
-        echo -e "\n${RED}当前尚未配置 DDNS，请先在主菜单选择 [1] 完成初次配置！${RESET}"
+        echo -e "\n${RED}未检测到配置文件，请先选择 [1] 完成初次配置！${RESET}"
         pause_return
         return 1
     fi
@@ -213,109 +570,152 @@ modify_config_menu() {
     while true; do
         # shellcheck source=/dev/null
         . "$CONFIG_FILE"
-
-        local proxy_status_str
-        if [ "$PROXIED" = "true" ]; then
-            proxy_status_str="${GREEN}开启 (true)${RESET}"
-        else
-            proxy_status_str="${YELLOW}关闭 (false)${RESET}"
-        fi
-
-        local masked_token="已配置"
-        if [ ${#CF_TOKEN} -gt 8 ]; then
-            masked_token="${CF_TOKEN:0:4}****${CF_TOKEN: -4}"
-        fi
+        PROVIDER="${PROVIDER:-cloudflare}"
 
         echo -e "\n${CYAN}=========================================${RESET}"
-        echo -e "${CYAN}          修改 DDNS 配置 (二级菜单)      ${RESET}"
+        echo -e "${CYAN}     修改 DDNS 配置 (服务商: ${PROVIDER})   ${RESET}"
         echo -e "${CYAN}=========================================${RESET}"
-        echo -e "  1. 修改 Cloudflare 邮箱  [当前: ${YELLOW}${CF_EMAIL}${RESET}]"
-        echo -e "  2. 修改 DDNS 域名        [当前: ${GREEN}${RECORD_NAME}${RESET}]"
-        echo -e "  3. 修改 API Token        [当前: ${YELLOW}${masked_token}${RESET}]"
-        echo -e "  4. 切换解析类型 (A/AAAA) [当前: ${CYAN}${RECORD_TYPE}${RESET}]"
-        echo -e "  5. 切换小黄云 CDN 开关   [当前: ${proxy_status_str}]"
-        echo -e "  0. 返回主菜单"
-        echo -e "${CYAN}=========================================${RESET}"
-        read -rp "请输入要修改的选项 [0-5]: " sub_choice
 
-        case "$sub_choice" in
-            1)
-                read -rp "请输入新的 Cloudflare 邮箱: " new_email
-                new_email=$(echo "$new_email" | tr -d '[:space:]')
-                if [ -z "$new_email" ]; then
-                    echo -e "${RED}邮箱不能为空，已取消修改！${RESET}"
-                else
-                    verify_and_save_config "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
-                fi
-                pause_return
-                ;;
-            2)
-                read -rp "请输入新的 DDNS 域名 (如 ddns.example.com): " new_domain
-                new_domain=$(echo "$new_domain" | tr -d '[:space:]')
-                if [ -z "$new_domain" ]; then
-                    echo -e "${RED}域名不能为空，已取消修改！${RESET}"
-                else
-                    verify_and_save_config "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
-                fi
-                pause_return
-                ;;
-            3)
-                read -rp "请输入新的 Cloudflare API Token: " new_token
-                new_token=$(echo "$new_token" | tr -d '[:space:]')
-                if [ -z "$new_token" ]; then
-                    echo -e "${RED}Token 不能为空，已取消修改！${RESET}"
-                else
-                    verify_and_save_config "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
-                fi
-                pause_return
-                ;;
-            4)
-                echo -e "当前解析类型为: ${CYAN}${RECORD_TYPE}${RESET}"
-                read -rp "请选择新的解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_choice
-                local new_type
-                if [ "$new_type_choice" = "1" ]; then
-                    new_type="A"
-                elif [ "$new_type_choice" = "2" ]; then
-                    new_type="AAAA"
-                else
-                    echo -e "${RED}输入无效，已取消修改！${RESET}"
-                    pause_return
-                    continue
-                fi
-                verify_and_save_config "$CF_EMAIL" "$RECORD_NAME" "$CF_TOKEN" "$new_type" "$PROXIED"
-                pause_return
-                ;;
-            5)
-                echo -e "当前小黄云 CDN 状态为: ${proxy_status_str}"
-                read -rp "请选择小黄云状态 [1: 关闭(false) / 2: 开启(true)]: " new_proxy_choice
-                local new_proxy
-                if [ "$new_proxy_choice" = "1" ]; then
-                    new_proxy="false"
-                elif [ "$new_proxy_choice" = "2" ]; then
-                    new_proxy="true"
-                else
-                    echo -e "${RED}输入无效，已取消修改！${RESET}"
-                    pause_return
-                    continue
-                fi
-                sed -i "s/^PROXIED=.*/PROXIED=\"${new_proxy}\"/" "$CONFIG_FILE"
-                rm -f "$IP_CACHE_FILE"
-                echo -e "${GREEN}小黄云状态已更新为: ${new_proxy}，正在同步至 Cloudflare...${RESET}"
-                update_ddns "interactive"
-                pause_return
-                ;;
-            0)
-                break
-                ;;
-            *)
-                echo -e "${RED}无效选项，请重新输入！${RESET}"
-                pause_return
-                ;;
-        esac
+        if [ "$PROVIDER" = "huawei" ]; then
+            local masked_sk="已配置"
+            [ ${#HW_SK} -gt 8 ] && masked_sk="${HW_SK:0:4}****${HW_SK: -4}"
+            echo -e "  1. 修改华为云 AK        [当前: ${YELLOW}${HW_AK}${RESET}]"
+            echo -e "  2. 修改华为云 SK        [当前: ${YELLOW}${masked_sk}${RESET}]"
+            echo -e "  3. 修改 DDNS 域名       [当前: ${GREEN}${RECORD_NAME}${RESET}]"
+            echo -e "  4. 切换解析类型(A/AAAA) [当前: ${CYAN}${RECORD_TYPE}${RESET}]"
+            echo -e "  5. 修改 TTL 缓存时间    [当前: ${GREEN}${HW_TTL:-1}秒${RESET}]"
+            echo -e "  0. 返回主菜单"
+            echo -e "${CYAN}=========================================${RESET}"
+            read -rp "请输入要修改的选项 [0-5]: " sub_choice
+
+            case "$sub_choice" in
+                1)
+                    read -rp "请输入新的 AK: " new_ak
+                    new_ak=$(echo "$new_ak" | tr -d '[:space:]')
+                    if [ -z "$new_ak" ]; then
+                        echo -e "${RED}AK 不能为空，已取消修改！${RESET}"
+                    else
+                        verify_and_save_hw "$new_ak" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
+                    fi
+                    pause_return ;;
+                2)
+                    read -rp "请输入新的 SK: " new_sk
+                    new_sk=$(echo "$new_sk" | tr -d '[:space:]')
+                    if [ -z "$new_sk" ]; then
+                        echo -e "${RED}SK 不能为空，已取消修改！${RESET}"
+                    else
+                        verify_and_save_hw "$HW_AK" "$new_sk" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
+                    fi
+                    pause_return ;;
+                3)
+                    read -rp "请输入新的域名: " new_domain
+                    new_domain=$(echo "$new_domain" | tr -d '[:space:]')
+                    new_domain="${new_domain%.}"
+                    if [ -z "$new_domain" ]; then
+                        echo -e "${RED}域名不能为空，已取消修改！${RESET}"
+                    else
+                        verify_and_save_hw "$HW_AK" "$HW_SK" "$new_domain" "$RECORD_TYPE" "$HW_TTL"
+                    fi
+                    pause_return ;;
+                4)
+                    read -rp "请选择解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_c
+                    if [ "$new_type_c" = "1" ]; then
+                        verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "A" "$HW_TTL"
+                    elif [ "$new_type_c" = "2" ]; then
+                        verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "AAAA" "$HW_TTL"
+                    else
+                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                    fi
+                    pause_return ;;
+                5)
+                    read -rp "请输入新的 TTL 秒数 (默认 1): " new_ttl
+                    new_ttl=$(echo "$new_ttl" | tr -cd '0-9')
+                    new_ttl=${new_ttl:-1}
+                    [ "$new_ttl" -lt 1 ] && new_ttl=1
+                    verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$new_ttl"
+                    pause_return ;;
+                0) break ;;
+                *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+            esac
+        else
+            local proxy_str="${YELLOW}关闭 (false)${RESET}"
+            [ "$PROXIED" = "true" ] && proxy_str="${GREEN}开启 (true)${RESET}"
+            local masked_token="已配置"
+            [ ${#CF_TOKEN} -gt 8 ] && masked_token="${CF_TOKEN:0:4}****${CF_TOKEN: -4}"
+            echo -e "  1. 修改 CF 邮箱         [当前: ${YELLOW}${CF_EMAIL}${RESET}]"
+            echo -e "  2. 修改 DDNS 域名       [当前: ${GREEN}${RECORD_NAME}${RESET}]"
+            echo -e "  3. 修改 API Token       [当前: ${YELLOW}${masked_token}${RESET}]"
+            echo -e "  4. 切换解析类型(A/AAAA) [当前: ${CYAN}${RECORD_TYPE}${RESET}]"
+            echo -e "  5. 切换小黄云代理开关   [当前: ${proxy_str}]"
+            echo -e "  0. 返回主菜单"
+            echo -e "${CYAN}=========================================${RESET}"
+            read -rp "请输入要修改的选项 [0-5]: " sub_choice
+
+            case "$sub_choice" in
+                1)
+                    read -rp "请输入新的 CF 邮箱: " new_email
+                    new_email=$(echo "$new_email" | tr -d '[:space:]')
+                    if [ -z "$new_email" ]; then
+                        echo -e "${RED}邮箱不能为空，已取消修改！${RESET}"
+                    else
+                        verify_and_save_cf "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
+                    fi
+                    pause_return ;;
+                2)
+                    read -rp "请输入新的域名: " new_domain
+                    new_domain=$(echo "$new_domain" | tr -d '[:space:]')
+                    new_domain="${new_domain%.}"
+                    if [ -z "$new_domain" ]; then
+                        echo -e "${RED}域名不能为空，已取消修改！${RESET}"
+                    else
+                        verify_and_save_cf "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
+                    fi
+                    pause_return ;;
+                3)
+                    read -rp "请输入新的 Token: " new_token
+                    new_token=$(echo "$new_token" | tr -d '[:space:]')
+                    if [ -z "$new_token" ]; then
+                        echo -e "${RED}Token 不能为空，已取消修改！${RESET}"
+                    else
+                        verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
+                    fi
+                    pause_return ;;
+                4)
+                    read -rp "请选择解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_c
+                    if [ "$new_type_c" = "1" ]; then
+                        verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$CF_TOKEN" "A" "$PROXIED"
+                    elif [ "$new_type_c" = "2" ]; then
+                        verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$CF_TOKEN" "AAAA" "$PROXIED"
+                    else
+                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                    fi
+                    pause_return ;;
+                5)
+                    read -rp "请选择小黄云状态 [1: 关闭(false) / 2: 开启(true)]: " new_proxy_c
+                    local new_p=""
+                    if [ "$new_proxy_c" = "1" ]; then
+                        new_p="false"
+                    elif [ "$new_proxy_c" = "2" ]; then
+                        new_p="true"
+                    else
+                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        pause_return
+                        continue
+                    fi
+                    sed -i "s/^PROXIED=.*/PROXIED=\"${new_p}\"/" "$CONFIG_FILE"
+                    rm -f "$IP_CACHE_FILE"
+                    echo -e "${GREEN}小黄云状态已更新为: ${new_p}，正在同步...${RESET}"
+                    update_ddns "interactive"
+                    wakeup_daemon
+                    pause_return ;;
+                0) break ;;
+                *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+            esac
+        fi
     done
 }
 
-# 核心更新逻辑
+# ==================== 统一更新逻辑 ====================
 update_ddns() {
     local mode="$1"
 
@@ -327,60 +727,119 @@ update_ddns() {
 
     # shellcheck source=/dev/null
     . "$CONFIG_FILE"
+    PROVIDER="${PROVIDER:-cloudflare}"
 
     current_ip=$(get_public_ip "$RECORD_TYPE")
     date '+%Y-%m-%d %H:%M:%S' > "$LAST_CHECK_FILE"
 
     if [ -z "$current_ip" ]; then
-        log_msg "错误: 无法获取本机公网 ${RECORD_TYPE} 地址"
-        [ "$mode" = "interactive" ] && echo -e "${RED}无法获取本机公网 IP，请检查网络连接！${RESET}"
+        log_msg "错误: 国际与国内检测源均无法获取本机公网 ${RECORD_TYPE} 地址，已保留原记录"
+        [ "$mode" = "interactive" ] && echo -e "${RED}无法获取本机公网 IP (国际/国内源均失败)，已安全保留原解析记录！${RESET}"
         return 1
     fi
 
     cached_ip=""
-    [ -f "$IP_CACHE_FILE" ] && cached_ip=$(cat "$IP_CACHE_FILE" | tr -d '[:space:]')
+    [ -f "$IP_CACHE_FILE" ] && cached_ip=$(tr -d '[:space:]' < "$IP_CACHE_FILE")
 
     if [ "$current_ip" = "$cached_ip" ] && [ "$mode" != "interactive" ]; then
         return 0
     fi
 
-    [ "$mode" = "interactive" ] && echo -e "当前公网 IP: ${CYAN}${current_ip}${RESET}，正在同步至 Cloudflare..."
+    [ "$mode" = "interactive" ] && echo -e "当前公网 IP: ${CYAN}${current_ip}${RESET}，正在同步至 ${PROVIDER}..."
 
-    if [ -z "$RECORD_ID" ]; then
-        record_resp=$(cf_api "GET" "/zones/${ZONE_ID}/dns_records?type=${RECORD_TYPE}&name=${RECORD_NAME}")
-        RECORD_ID=$(echo "$record_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
-    fi
+    if [ "$PROVIDER" = "huawei" ]; then
+        local formatted_name="${RECORD_NAME}."
+        local ttl_val="${HW_TTL:-1}"
+        local update_resp
+        local payload="{\"name\":\"${formatted_name}\",\"type\":\"${RECORD_TYPE}\",\"records\":[\"${current_ip}\"],\"ttl\":${ttl_val}}"
 
-    local endpoint method
-    if [ -z "$RECORD_ID" ]; then
-        endpoint="/zones/${ZONE_ID}/dns_records"
-        method="POST"
-    else
-        endpoint="/zones/${ZONE_ID}/dns_records/${RECORD_ID}"
-        method="PUT"
-    fi
-
-    local payload="{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":${PROXIED}}"
-    update_resp=$(cf_api "$method" "$endpoint" "$payload")
-
-    if echo "$update_resp" | grep -q '"success":true'; then
-        new_id=$(echo "$update_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
-        if [ -z "$RECORD_ID" ] && [ -n "$new_id" ]; then
-            sed -i "s/^RECORD_ID=.*/RECORD_ID=\"${new_id}\"/" "$CONFIG_FILE"
+        if [ -z "$RECORD_ID" ]; then
+            local find_resp
+            find_resp=$(hw_api "GET" "/v2/zones/${ZONE_ID}/recordsets?name=${formatted_name}&type=${RECORD_TYPE}" "")
+            RECORD_ID=$(hw_parse_id "$find_resp" "recordsets" "$formatted_name" "$RECORD_TYPE")
+            [ -n "$RECORD_ID" ] && sed -i "s/^RECORD_ID=.*/RECORD_ID=\"${RECORD_ID}\"/" "$CONFIG_FILE"
         fi
-        echo "$current_ip" > "$IP_CACHE_FILE"
-        log_msg "更新成功: ${RECORD_NAME} (${RECORD_TYPE}) -> ${current_ip} (Proxied: ${PROXIED})"
-        [ "$mode" = "interactive" ] && echo -e "${GREEN}DDNS 更新成功！${RECORD_NAME} -> ${current_ip} (小黄云: ${PROXIED})${RESET}"
+
+        if [ -n "$RECORD_ID" ]; then
+            update_resp=$(hw_api "PUT" "/v2/zones/${ZONE_ID}/recordsets/${RECORD_ID}" "$payload")
+            # 若记录在云端被手动删除导致 PUT 失败，自动清空失效 ID 并回退为 POST 重建
+            if ! echo "$update_resp" | grep -q '"records"'; then
+                RECORD_ID=""
+                sed -i "s/^RECORD_ID=.*/RECORD_ID=\"\"/" "$CONFIG_FILE"
+            fi
+        fi
+
+        if [ -z "$RECORD_ID" ]; then
+            update_resp=$(hw_api "POST" "/v2/zones/${ZONE_ID}/recordsets" "$payload")
+            RECORD_ID=$(hw_parse_id "$update_resp" "direct" "" "")
+            [ -n "$RECORD_ID" ] && sed -i "s/^RECORD_ID=.*/RECORD_ID=\"${RECORD_ID}\"/" "$CONFIG_FILE"
+        fi
+
+        if echo "$update_resp" | grep -q '"records"'; then
+            echo "$current_ip" > "$IP_CACHE_FILE"
+            log_msg "更新成功(华为云): ${RECORD_NAME} -> ${current_ip} (TTL: ${ttl_val}s)"
+            [ "$mode" = "interactive" ] && echo -e "${GREEN}华为云 DDNS 更新成功！${RECORD_NAME} -> ${current_ip} (TTL: ${ttl_val}秒)${RESET}"
+        else
+            log_msg "更新失败(华为云): ${update_resp}"
+            [ "$mode" = "interactive" ] && echo -e "${RED}更新失败，返回信息: ${update_resp}${RESET}"
+            return 1
+        fi
     else
-        log_msg "更新失败: ${update_resp}"
-        [ "$mode" = "interactive" ] && echo -e "${RED}更新失败，返回信息: ${update_resp}${RESET}"
-        return 1
+        # Cloudflare 纯 Shell 轻量更新逻辑
+        local payload="{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":${PROXIED}}"
+        local update_resp
+
+        if [ -z "$RECORD_ID" ]; then
+            record_resp=$(cf_api "GET" "/zones/${ZONE_ID}/dns_records?type=${RECORD_TYPE}&name=${RECORD_NAME}")
+            if echo "$record_resp" | grep -q '"success":true'; then
+                RECORD_ID=$(echo "$record_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+                [ -n "$RECORD_ID" ] && sed -i "s/^RECORD_ID=.*/RECORD_ID=\"${RECORD_ID}\"/" "$CONFIG_FILE"
+            fi
+        fi
+
+        if [ -n "$RECORD_ID" ]; then
+            update_resp=$(cf_api "PUT" "/zones/${ZONE_ID}/dns_records/${RECORD_ID}" "$payload")
+            # 若记录在云端被手动删除导致 PUT 失败，自动清空失效 ID 并回退为 POST 重建
+            if ! echo "$update_resp" | grep -q '"success":true'; then
+                RECORD_ID=""
+                sed -i "s/^RECORD_ID=.*/RECORD_ID=\"\"/" "$CONFIG_FILE"
+            fi
+        fi
+
+        if [ -z "$RECORD_ID" ]; then
+            update_resp=$(cf_api "POST" "/zones/${ZONE_ID}/dns_records" "$payload")
+        fi
+
+        if echo "$update_resp" | grep -q '"success":true'; then
+            new_id=$(echo "$update_resp" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+            if [ -n "$new_id" ] && [ "$new_id" != "$RECORD_ID" ]; then
+                sed -i "s/^RECORD_ID=.*/RECORD_ID=\"${new_id}\"/" "$CONFIG_FILE"
+            fi
+            echo "$current_ip" > "$IP_CACHE_FILE"
+            log_msg "更新成功(Cloudflare): ${RECORD_NAME} (${RECORD_TYPE}) -> ${current_ip} (Proxied: ${PROXIED})"
+            [ "$mode" = "interactive" ] && echo -e "${GREEN}Cloudflare DDNS 更新成功！${RECORD_NAME} -> ${current_ip} (小黄云: ${PROXIED})${RESET}"
+        else
+            log_msg "更新失败(Cloudflare): ${update_resp}"
+            [ "$mode" = "interactive" ] && echo -e "${RED}更新失败，返回信息: ${update_resp}${RESET}"
+            return 1
+        fi
     fi
 }
 
-# 后台守护循环 (按秒执行)
+# 后台守护循环 (单实例互斥 + 实时读取间隔)
 run_daemon() {
     local arg_interval="$1"
+
+    # 若已有旧守护进程在运行，先清理旧进程防止多实例冲突
+    if [ -f "$PID_FILE" ]; then
+        local old_pid
+        old_pid=$(tr -cd '0-9' < "$PID_FILE")
+        if [ -n "$old_pid" ] && [ "$old_pid" != "$$" ] && kill -0 "$old_pid" 2>/dev/null; then
+            pkill -P "$old_pid" 2>/dev/null || true
+            kill "$old_pid" 2>/dev/null || true
+        fi
+    fi
+
     echo $$ > "$PID_FILE"
     trap 'kill $(jobs -p) 2>/dev/null; rm -f "$PID_FILE"; exit 0' TERM INT
 
@@ -401,7 +860,7 @@ run_daemon() {
         fi
         update_ddns "daemon"
         sleep "$interval" &
-        wait $!
+        wait $! 2>/dev/null || true
     done
 }
 
@@ -419,17 +878,14 @@ stop_timer() {
         local pid
         pid=$(tr -cd '0-9' < "$PID_FILE")
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            # 先终止子进程 (sleep)，再终止主进程
-            pkill -P "$pid" 2>/dev/null
-            kill "$pid" 2>/dev/null
+            pkill -P "$pid" 2>/dev/null || true
+            kill "$pid" 2>/dev/null || true
         fi
         rm -f "$PID_FILE"
     fi
 
-    # 彻底清理可能残留的同名守护进程
-    pkill -f "${SCRIPT_PATH} --daemon" 2>/dev/null
-
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null
+    pkill -f "${SCRIPT_PATH} --daemon" 2>/dev/null || true
+    crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
     [ "$quiet" != "quiet" ] && echo -e "${GREEN}已停止后台 DDNS 定时任务。${RESET}"
 }
 
@@ -442,19 +898,17 @@ setup_timer() {
 
     echo -e "\n${CYAN}--- 设置后台定时任务 (按秒执行) ---${RESET}"
     read -rp "定时任务设置时间（默认120秒，支持最小5秒）：" raw_interval
-    # 清理所有空白符与回车符
     interval=$(echo "$raw_interval" | tr -d '[:space:]')
     interval=${interval:-120}
 
-    # 兼容 bash 与 sh (dash) 的纯数字校验
     case "$interval" in
         ''|*[!0-9]*)
-            echo -e "${YELLOW}输入包含非数字字符，已自动使用默认值 120 秒。${RESET}"
+            echo -e "${YELLOW}输入包含非数字字符，已使用默认值 120 秒。${RESET}"
             interval=120
             ;;
         *)
             if [ "$interval" -lt 5 ]; then
-                echo -e "${YELLOW}输入小于 5 秒，已自动设为最小允许值 5 秒。${RESET}"
+                echo -e "${YELLOW}输入小于 5 秒，已设为最小允许值 5 秒。${RESET}"
                 interval=5
             fi
             ;;
@@ -466,7 +920,7 @@ setup_timer() {
     if [ "$(id -u)" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
         cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=Cloudflare Lightweight DDNS Service
+Description=Lightweight Multi-Provider DDNS Service
 After=network-online.target
 Wants=network-online.target
 
@@ -474,7 +928,7 @@ Wants=network-online.target
 Type=simple
 Environment="HOME=${HOME}"
 Environment="CONFIG_DIR=${CONFIG_DIR}"
-ExecStart=/bin/bash ${SCRIPT_PATH} --daemon ${interval}
+ExecStart=/usr/bin/env bash ${SCRIPT_PATH} --daemon ${interval}
 Restart=always
 RestartSec=5
 
@@ -485,8 +939,8 @@ EOF
         systemctl enable --now cf-ddns.service >/dev/null 2>&1
         echo -e "${GREEN}后台定时任务已启动 (Systemd 服务，支持开机自启)！检测间隔：每 ${interval} 秒。${RESET}"
     else
-        nohup env HOME="$HOME" CONFIG_DIR="$CONFIG_DIR" /bin/bash "$SCRIPT_PATH" --daemon "$interval" >/dev/null 2>&1 &
-        (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH"; echo "@reboot env HOME=\"$HOME\" CONFIG_DIR=\"$CONFIG_DIR\" nohup /bin/bash ${SCRIPT_PATH} --daemon ${interval} >/dev/null 2>&1 &") | crontab - 2>/dev/null
+        nohup env HOME="$HOME" CONFIG_DIR="$CONFIG_DIR" /usr/bin/env bash "$SCRIPT_PATH" --daemon "$interval" >/dev/null 2>&1 &
+        (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH"; echo "@reboot env HOME=\"$HOME\" CONFIG_DIR=\"$CONFIG_DIR\" nohup /usr/bin/env bash ${SCRIPT_PATH} --daemon ${interval} >/dev/null 2>&1 &") | crontab - 2>/dev/null
         echo -e "${GREEN}后台定时任务已启动 (Nohup 守护进程)！检测间隔：每 ${interval} 秒。${RESET}"
     fi
 }
@@ -497,14 +951,20 @@ show_status() {
     if [ -f "$CONFIG_FILE" ]; then
         # shellcheck source=/dev/null
         . "$CONFIG_FILE"
-        echo -e "绑定邮箱: ${CF_EMAIL}"
-        echo -e "监控域名: ${GREEN}${RECORD_NAME}${RESET} (${RECORD_TYPE})"
-        echo -e "鉴权模式: ${AUTH_MODE} Token"
-        echo -e "CDN 代理: ${PROXIED}"
-        echo -e "缓存 IP : ${YELLOW}$([ -f "$IP_CACHE_FILE" ] && cat "$IP_CACHE_FILE" || echo "尚无缓存")${RESET}"
-        echo -e "最后检测: ${CYAN}$([ -f "$LAST_CHECK_FILE" ] && cat "$LAST_CHECK_FILE" || echo "尚无记录")${RESET}"
+        echo -e "DNS 服务商: ${CYAN}${PROVIDER:-cloudflare}${RESET}"
+        echo -e "监控域名  : ${GREEN}${RECORD_NAME}${RESET} (${RECORD_TYPE})"
+        if [ "${PROVIDER:-cloudflare}" = "huawei" ]; then
+            echo -e "绑定 AK   : ${HW_AK}"
+            echo -e "TTL 设定  : ${GREEN}${HW_TTL:-1} 秒 (极速生效)${RESET}"
+        else
+            echo -e "绑定邮箱  : ${CF_EMAIL}"
+            echo -e "鉴权模式  : ${AUTH_MODE} Token"
+            echo -e "CDN 代理  : ${PROXIED}"
+        fi
+        echo -e "缓存 IP   : ${YELLOW}$([ -f "$IP_CACHE_FILE" ] && cat "$IP_CACHE_FILE" || echo "尚无缓存")${RESET}"
+        echo -e "最后检测  : ${CYAN}$([ -f "$LAST_CHECK_FILE" ] && cat "$LAST_CHECK_FILE" || echo "尚无记录")${RESET}"
     else
-        echo -e "配置状态: ${RED}尚未配置${RESET}"
+        echo -e "配置状态  : ${RED}尚未配置${RESET}"
     fi
 
     local cur_interval="120"
@@ -515,9 +975,9 @@ show_status() {
     fi
 
     if [ -f "$PID_FILE" ] && kill -0 "$(tr -cd '0-9' < "$PID_FILE")" 2>/dev/null; then
-        echo -e "定时状态: ${GREEN}后台运行中${RESET} (PID: $(tr -cd '0-9' < "$PID_FILE") | 间隔: ${cur_interval} 秒)"
+        echo -e "定时状态  : ${GREEN}后台运行中${RESET} (PID: $(tr -cd '0-9' < "$PID_FILE") | 间隔: ${cur_interval} 秒)"
     else
-        echo -e "定时状态: ${YELLOW}未运行${RESET}"
+        echo -e "定时状态  : ${YELLOW}未运行${RESET}"
     fi
 
     echo -e "\n${CYAN}--- 最近 15 条运行日志 ---${RESET}"
@@ -528,12 +988,12 @@ show_status() {
     fi
 }
 
-# 卸载脚本与清理所有数据
+# 彻底卸载脚本
 uninstall_ddns() {
     echo -e "\n${RED}=================== 警告 ===================${RESET}"
-    echo -e "${YELLOW}即将彻底卸载 Cloudflare DDNS 脚本！该操作将：${RESET}"
+    echo -e "${YELLOW}即将彻底卸载 DDNS 脚本！该操作将：${RESET}"
     echo "  1. 停止并移除后台定时任务与开机自启服务"
-    echo "  2. 删除所有配置文件、IP缓存与运行日志 ($CONFIG_DIR)"
+    echo "  2. 删除所有配置文件、IP 缓存与运行日志 ($CONFIG_DIR)"
     echo "  3. 删除当前脚本文件自身 ($SCRIPT_PATH)"
     echo -e "${RED}============================================${RESET}"
     read -rp "确认要彻底卸载吗？[y/N]: " confirm_uninst
@@ -543,7 +1003,7 @@ uninstall_ddns() {
             stop_timer "quiet"
             rm -rf "$CONFIG_DIR"
             rm -f "$SCRIPT_PATH"
-            echo -e "${GREEN}卸载完成！所有服务、配置及脚本文件均已彻底清除。${RESET}"
+            echo -e "${GREEN}卸载完成！所有服务、配置及脚本自身已彻底清除。${RESET}"
             exit 0
             ;;
         *)
@@ -558,13 +1018,16 @@ if [ "$1" = "--daemon" ]; then
     exit 0
 fi
 
-# SSH 交互式主菜单
+# 启动仅检查基础轻量依赖 curl (不预装 python3，保持 Cloudflare 模式超轻量)
+ensure_dependencies "curl"
+
+# 主交互菜单
 while true; do
     echo -e "\n${CYAN}=========================================${RESET}"
-    echo -e "${CYAN}     Cloudflare 轻量级 DDNS 管理脚本     ${RESET}"
+    echo -e "${CYAN}     多平台轻量级 DDNS 管理脚本          ${RESET}"
     echo -e "${CYAN}=========================================${RESET}"
-    echo "  1. 初次配置 DDNS (仅需邮箱 + 域名 + Token)"
-    echo "  2. 修改现有配置 (邮箱/域名/Token/小黄云等)"
+    echo "  1. 初次配置 DDNS (Cloudflare / 华为云)"
+    echo "  2. 修改现有配置 (二级菜单单项修改)"
     echo "  3. 立即执行一次 DDNS 同步 (测试/强制刷新)"
     echo "  4. 开启 / 修改后台定时任务 (按秒设置)"
     echo "  5. 停止后台定时任务"
