@@ -35,9 +35,20 @@ LOG_FILE="$CONFIG_DIR/ddns.log"
 IP_CACHE_FILE="$CONFIG_DIR/last_ip.txt"
 LAST_CHECK_FILE="$CONFIG_DIR/last_check.txt"
 PID_FILE="$CONFIG_DIR/ddns.pid"
-SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
 mkdir -p "$CONFIG_DIR" 2>/dev/null
+
+# ==================== 路径持久化修复 ====================
+# 检测是否通过 curl/wget 管道执行 (例如 /dev/fd/* 或 /proc/self/fd/*)
+# 若是临时文件描述符，自动将脚本落盘保存至配置目录，防止 Systemd 找不到文件导致 127 报错
+_RAW_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+if [[ "$_RAW_PATH" == *"/dev/fd/"* ]] || [[ "$_RAW_PATH" == *"/proc/"* ]] || [ ! -f "$_RAW_PATH" ]; then
+    SCRIPT_PATH="$CONFIG_DIR/cf-ddns.sh"
+    cat "$0" > "$SCRIPT_PATH" 2>/dev/null || true
+    chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+else
+    SCRIPT_PATH="$_RAW_PATH"
+fi
 
 # 颜色定义
 GREEN="\033[32m"
@@ -168,7 +179,6 @@ is_valid_ip() {
     [ -z "$ip_str" ] && return 1
 
     if [ "$ip_type" = "AAAA" ]; then
-        # 合法 IPv6 至少包含两个冒号，且仅由十六进制字符与冒号组成
         if [[ "$ip_str" == *:*:* ]] && [[ "$ip_str" =~ ^[0-9a-fA-F:]+$ ]]; then
             return 0
         fi
@@ -193,7 +203,6 @@ get_public_ip() {
     local ip=""
 
     if [ "$type" = "AAAA" ]; then
-        # 1. 国际 IPv6 检测源
         for url in "https://ipv6.icanhazip.com" "https://api6.ipify.org" "https://v6.ident.me"; do
             ip=$(curl -s -6 --max-time 3 "$url" | tr -d '[:space:]')
             if is_valid_ip "$ip" "AAAA"; then
@@ -201,7 +210,6 @@ get_public_ip() {
                 return 0
             fi
         done
-        # 2. 国内 IPv6 检测源兜底
         for url in "https://6.ipw.cn" "https://v6.myip.la" "https://speed.neu6.edu.cn/getIP.php"; do
             ip=$(curl -s -6 --max-time 4 "$url" | tr -d '[:space:]')
             if is_valid_ip "$ip" "AAAA"; then
@@ -210,7 +218,6 @@ get_public_ip() {
             fi
         done
     else
-        # 1. 国际 IPv4 检测源
         for url in "https://ipv4.icanhazip.com" "https://api.ipify.org" "https://ident.me"; do
             ip=$(curl -s -4 --max-time 3 "$url" | tr -d '[:space:]')
             if is_valid_ip "$ip" "A"; then
@@ -218,7 +225,6 @@ get_public_ip() {
                 return 0
             fi
         done
-        # 2. 国内 IPv4 纯文本检测源兜底 (不做模糊 HTML 提取，防止把网关错误码当成 IP)
         for url in "https://4.ipw.cn" "https://ip.3322.net" "https://v4.myip.la"; do
             ip=$(curl -s -4 --max-time 4 "$url" | tr -d '[:space:]')
             if is_valid_ip "$ip" "A"; then
@@ -232,7 +238,7 @@ get_public_ip() {
     return 1
 }
 
-# ==================== Cloudflare 专用模块 (纯 Shell 物理隔离) ====================
+# ==================== Cloudflare 专用模块 ====================
 cf_api() {
     local method="$1"
     local endpoint="$2"
@@ -341,7 +347,7 @@ EOF
     return 0
 }
 
-# ==================== 华为云 专用模块 (按需调用 Python3 签名) ====================
+# ==================== 华为云 专用模块 ====================
 hw_api() {
     local method="$1"
     local uri="$2"
@@ -440,7 +446,6 @@ verify_and_save_hw() {
     local v_type="$4"
     local v_ttl="${5:-1}"
 
-    # 仅在使用华为云时按需检测并安装 python3
     if ! ensure_dependencies "python3"; then
         return 1
     fi
@@ -559,7 +564,7 @@ configure_ddns() {
     fi
 }
 
-# ==================== 二级菜单：按需修改现有配置 ====================
+# ==================== 二级菜单：修改现有配置 ====================
 modify_config_menu() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "\n${RED}未检测到配置文件，请先选择 [1] 完成初次配置！${RESET}"
@@ -592,30 +597,18 @@ modify_config_menu() {
                 1)
                     read -rp "请输入新的 AK: " new_ak
                     new_ak=$(echo "$new_ak" | tr -d '[:space:]')
-                    if [ -z "$new_ak" ]; then
-                        echo -e "${RED}AK 不能为空，已取消修改！${RESET}"
-                    else
-                        verify_and_save_hw "$new_ak" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
-                    fi
+                    [ -z "$new_ak" ] && echo -e "${RED}AK 不能为空！${RESET}" || verify_and_save_hw "$new_ak" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
                     pause_return ;;
                 2)
                     read -rp "请输入新的 SK: " new_sk
                     new_sk=$(echo "$new_sk" | tr -d '[:space:]')
-                    if [ -z "$new_sk" ]; then
-                        echo -e "${RED}SK 不能为空，已取消修改！${RESET}"
-                    else
-                        verify_and_save_hw "$HW_AK" "$new_sk" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
-                    fi
+                    [ -z "$new_sk" ] && echo -e "${RED}SK 不能为空！${RESET}" || verify_and_save_hw "$HW_AK" "$new_sk" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
                     pause_return ;;
                 3)
                     read -rp "请输入新的域名: " new_domain
                     new_domain=$(echo "$new_domain" | tr -d '[:space:]')
                     new_domain="${new_domain%.}"
-                    if [ -z "$new_domain" ]; then
-                        echo -e "${RED}域名不能为空，已取消修改！${RESET}"
-                    else
-                        verify_and_save_hw "$HW_AK" "$HW_SK" "$new_domain" "$RECORD_TYPE" "$HW_TTL"
-                    fi
+                    [ -z "$new_domain" ] && echo -e "${RED}域名不能为空！${RESET}" || verify_and_save_hw "$HW_AK" "$HW_SK" "$new_domain" "$RECORD_TYPE" "$HW_TTL"
                     pause_return ;;
                 4)
                     read -rp "请选择解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_c
@@ -624,7 +617,7 @@ modify_config_menu() {
                     elif [ "$new_type_c" = "2" ]; then
                         verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "AAAA" "$HW_TTL"
                     else
-                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        echo -e "${RED}输入无效！${RESET}"
                     fi
                     pause_return ;;
                 5)
@@ -635,7 +628,7 @@ modify_config_menu() {
                     verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$new_ttl"
                     pause_return ;;
                 0) break ;;
-                *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+                *) echo -e "${RED}无效选项！${RESET}"; pause_return ;;
             esac
         else
             local proxy_str="${YELLOW}关闭 (false)${RESET}"
@@ -655,30 +648,18 @@ modify_config_menu() {
                 1)
                     read -rp "请输入新的 CF 邮箱: " new_email
                     new_email=$(echo "$new_email" | tr -d '[:space:]')
-                    if [ -z "$new_email" ]; then
-                        echo -e "${RED}邮箱不能为空，已取消修改！${RESET}"
-                    else
-                        verify_and_save_cf "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
-                    fi
+                    [ -z "$new_email" ] && echo -e "${RED}邮箱不能为空！${RESET}" || verify_and_save_cf "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
                     pause_return ;;
                 2)
                     read -rp "请输入新的域名: " new_domain
                     new_domain=$(echo "$new_domain" | tr -d '[:space:]')
                     new_domain="${new_domain%.}"
-                    if [ -z "$new_domain" ]; then
-                        echo -e "${RED}域名不能为空，已取消修改！${RESET}"
-                    else
-                        verify_and_save_cf "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
-                    fi
+                    [ -z "$new_domain" ] && echo -e "${RED}域名不能为空！${RESET}" || verify_and_save_cf "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
                     pause_return ;;
                 3)
                     read -rp "请输入新的 Token: " new_token
                     new_token=$(echo "$new_token" | tr -d '[:space:]')
-                    if [ -z "$new_token" ]; then
-                        echo -e "${RED}Token 不能为空，已取消修改！${RESET}"
-                    else
-                        verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
-                    fi
+                    [ -z "$new_token" ] && echo -e "${RED}Token 不能为空！${RESET}" || verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
                     pause_return ;;
                 4)
                     read -rp "请选择解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_c
@@ -687,7 +668,7 @@ modify_config_menu() {
                     elif [ "$new_type_c" = "2" ]; then
                         verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$CF_TOKEN" "AAAA" "$PROXIED"
                     else
-                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        echo -e "${RED}输入无效！${RESET}"
                     fi
                     pause_return ;;
                 5)
@@ -698,7 +679,7 @@ modify_config_menu() {
                     elif [ "$new_proxy_c" = "2" ]; then
                         new_p="true"
                     else
-                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        echo -e "${RED}输入无效！${RESET}"
                         pause_return
                         continue
                     fi
@@ -709,7 +690,7 @@ modify_config_menu() {
                     wakeup_daemon
                     pause_return ;;
                 0) break ;;
-                *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+                *) echo -e "${RED}无效选项！${RESET}"; pause_return ;;
             esac
         fi
     done
@@ -762,7 +743,6 @@ update_ddns() {
 
         if [ -n "$RECORD_ID" ]; then
             update_resp=$(hw_api "PUT" "/v2/zones/${ZONE_ID}/recordsets/${RECORD_ID}" "$payload")
-            # 若记录在云端被手动删除导致 PUT 失败，自动清空失效 ID 并回退为 POST 重建
             if ! echo "$update_resp" | grep -q '"records"'; then
                 RECORD_ID=""
                 sed -i "s/^RECORD_ID=.*/RECORD_ID=\"\"/" "$CONFIG_FILE"
@@ -785,7 +765,6 @@ update_ddns() {
             return 1
         fi
     else
-        # Cloudflare 纯 Shell 轻量更新逻辑
         local payload="{\"type\":\"${RECORD_TYPE}\",\"name\":\"${RECORD_NAME}\",\"content\":\"${current_ip}\",\"ttl\":60,\"proxied\":${PROXIED}}"
         local update_resp
 
@@ -799,7 +778,6 @@ update_ddns() {
 
         if [ -n "$RECORD_ID" ]; then
             update_resp=$(cf_api "PUT" "/zones/${ZONE_ID}/dns_records/${RECORD_ID}" "$payload")
-            # 若记录在云端被手动删除导致 PUT 失败，自动清空失效 ID 并回退为 POST 重建
             if ! echo "$update_resp" | grep -q '"success":true'; then
                 RECORD_ID=""
                 sed -i "s/^RECORD_ID=.*/RECORD_ID=\"\"/" "$CONFIG_FILE"
@@ -830,7 +808,6 @@ update_ddns() {
 run_daemon() {
     local arg_interval="$1"
 
-    # 若已有旧守护进程在运行，先清理旧进程防止多实例冲突
     if [ -f "$PID_FILE" ]; then
         local old_pid
         old_pid=$(tr -cd '0-9' < "$PID_FILE")
@@ -945,7 +922,7 @@ EOF
     fi
 }
 
-# 查看当前状态与日志
+# ==================== 状态展示修复 ====================
 show_status() {
     echo -e "\n${CYAN}--- 当前配置与运行状态 ---${RESET}"
     if [ -f "$CONFIG_FILE" ]; then
@@ -974,8 +951,23 @@ show_status() {
         [ -n "$tmp_int" ] && cur_interval="$tmp_int"
     fi
 
-    if [ -f "$PID_FILE" ] && kill -0 "$(tr -cd '0-9' < "$PID_FILE")" 2>/dev/null; then
-        echo -e "定时状态  : ${GREEN}后台运行中${RESET} (PID: $(tr -cd '0-9' < "$PID_FILE") | 间隔: ${cur_interval} 秒)"
+    # 双重状态判断：优先检查 Systemd 服务真实状态，兜底检查本地 PID/进程
+    local is_running=false
+    local run_pid=""
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet cf-ddns.service 2>/dev/null; then
+        is_running=true
+        run_pid=$(systemctl show -p MainPID --value cf-ddns.service 2>/dev/null)
+    elif [ -f "$PID_FILE" ] && kill -0 "$(tr -cd '0-9' < "$PID_FILE")" 2>/dev/null; then
+        is_running=true
+        run_pid=$(tr -cd '0-9' < "$PID_FILE")
+    else
+        run_pid=$(pgrep -f "${SCRIPT_PATH}.*--daemon" 2>/dev/null | head -n 1)
+        [ -n "$run_pid" ] && is_running=true
+    fi
+
+    if [ "$is_running" = true ]; then
+        echo -e "定时状态  : ${GREEN}后台运行中${RESET} (PID: ${run_pid:-未知} | 间隔: ${cur_interval} 秒)"
     else
         echo -e "定时状态  : ${YELLOW}未运行${RESET}"
     fi
