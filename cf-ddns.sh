@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # ====================================================
 # 多平台轻量级 DDNS 脚本 (Cloudflare 纯Shell极速版 & 华为云 TTL=1 | 国内外双栈IP源)
-# 特性：内存自重构固化技术，无视启动方式、无视路径变动、支持管道直接运行
 # ====================================================
 
 # 若用户使用 sh 启动，自动无缝切换至 bash 执行，防止语法报错
@@ -36,10 +35,20 @@ LOG_FILE="$CONFIG_DIR/ddns.log"
 IP_CACHE_FILE="$CONFIG_DIR/last_ip.txt"
 LAST_CHECK_FILE="$CONFIG_DIR/last_check.txt"
 PID_FILE="$CONFIG_DIR/ddns.pid"
-# 固定守护脚本路径（永远存放在配置目录内，无视外部脚本位置变化）
-SCRIPT_PATH="$CONFIG_DIR/cf-ddns.sh"
 
 mkdir -p "$CONFIG_DIR" 2>/dev/null
+
+# ==================== 路径持久化修复 ====================
+# 检测是否通过 curl/wget 管道执行 (例如 /dev/fd/* 或 /proc/self/fd/*)
+# 若是临时文件描述符，自动将脚本落盘保存至配置目录，防止 Systemd 找不到文件导致 127 报错
+_RAW_PATH="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
+if [[ "$_RAW_PATH" == *"/dev/fd/"* ]] || [[ "$_RAW_PATH" == *"/proc/"* ]] || [ ! -f "$_RAW_PATH" ]; then
+    SCRIPT_PATH="$CONFIG_DIR/cf-ddns.sh"
+    cat "$0" > "$SCRIPT_PATH" 2>/dev/null || true
+    chmod +x "$SCRIPT_PATH" 2>/dev/null || true
+else
+    SCRIPT_PATH="$_RAW_PATH"
+fi
 
 # 颜色定义
 GREEN="\033[32m"
@@ -47,91 +56,6 @@ RED="\033[31m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RESET="\033[0m"
-
-# ==================== 核心技术：内存自导出固化 ====================
-# 无论用户是通过 bash <(curl ...) 管道运行、还是把脚本放在任意目录甚至运行后删除，
-# 直接从当前 Bash 进程内存中提取完整脚本代码并固化到 $SCRIPT_PATH，100% 零外部依赖！
-persist_self() {
-    local raw_self=""
-    if [ -f "$0" ] && [[ "$0" != *"/dev/fd/"* ]] && [[ "$0" != *"/proc/"* ]]; then
-        raw_self="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
-    fi
-
-    # 若当前运行的就是已固化的脚本自身，无需重复写入
-    if [ "$raw_self" = "$SCRIPT_PATH" ] && [ -s "$SCRIPT_PATH" ]; then
-        chmod +x "$SCRIPT_PATH" 2>/dev/null || true
-        return 0
-    fi
-
-    # 情况1：若 $0 是真实的普通磁盘文件且包含完整代码，直接复制
-    if [ -n "$raw_self" ] && [ -s "$raw_self" ] && grep -q "ensure_dependencies" "$raw_self" 2>/dev/null; then
-        cp -f "$raw_self" "$SCRIPT_PATH" 2>/dev/null
-        chmod +x "$SCRIPT_PATH" 2>/dev/null
-        return 0
-    fi
-
-    # 情况2：通过管道 bash <(curl ...) 或 $0 已被删除时，直接从 Bash 内存导出所有函数重构完整脚本
-    cat > "${SCRIPT_PATH}.tmp" <<' HEADER_EOF'
-#!/usr/bin/env bash
-if [ -z "${BASH_VERSION:-}" ]; then exec /usr/bin/env bash "$0" "$@"; fi
-if [ -z "$HOME" ] || [ "$HOME" = "/" ]; then
-    HOME=$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)
-    [ -z "$HOME" ] && HOME="/root"
-fi
-SERVICE_FILE="/etc/systemd/system/cf-ddns.service"
-if [ -z "${CONFIG_DIR:-}" ] && [ -f "$SERVICE_FILE" ]; then
-    _svc_dir=$(grep '^Environment="CONFIG_DIR=' "$SERVICE_FILE" 2>/dev/null | head -n 1 | cut -d'=' -f3 | tr -d '"')
-    if [ -n "$_svc_dir" ] && { [ -w "$_svc_dir" ] || [ "$(id -u)" -eq 0 ]; }; then
-        CONFIG_DIR="$_svc_dir"
-    fi
-fi
-CONFIG_DIR="${CONFIG_DIR:-$HOME/.cf_ddns}"
-CONFIG_FILE="$CONFIG_DIR/config.conf"
-INTERVAL_FILE="$CONFIG_DIR/interval.conf"
-LOG_FILE="$CONFIG_DIR/ddns.log"
-IP_CACHE_FILE="$CONFIG_DIR/last_ip.txt"
-LAST_CHECK_FILE="$CONFIG_DIR/last_check.txt"
-PID_FILE="$CONFIG_DIR/ddns.pid"
-SCRIPT_PATH="$CONFIG_DIR/cf-ddns.sh"
-mkdir -p "$CONFIG_DIR" 2>/dev/null
-GREEN="\033[32m"; RED="\033[31m"; YELLOW="\033[33m"; CYAN="\033[36m"; RESET="\033[0m"
-HEADER_EOF
-
-    # 将内存中的所有业务函数完整导出到脚本文件
-    declare -f \
-        persist_self \
-        ensure_dependencies \
-        pause_return \
-        wakeup_daemon \
-        log_msg \
-        is_valid_ip \
-        get_public_ip \
-        cf_api \
-        verify_and_save_cf \
-        hw_api \
-        hw_parse_id \
-        verify_and_save_hw \
-        configure_ddns \
-        modify_config_menu \
-        update_ddns \
-        run_daemon \
-        stop_timer \
-        setup_timer \
-        show_status \
-        uninstall_ddns \
-        main_menu >> "${SCRIPT_PATH}.tmp"
-
-    cat >> "${SCRIPT_PATH}.tmp" <<'FOOTER_EOF'
-if [ "${1:-}" = "--daemon" ]; then
-    run_daemon "${2:-}"
-    exit 0
-fi
-main_menu "$@"
-FOOTER_EOF
-
-    mv -f "${SCRIPT_PATH}.tmp" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH" 2>/dev/null
-}
 
 # 按需检测并自动安装缺失环境 (保持 Cloudflare 纯净轻量，仅在需要时安装对应依赖)
 ensure_dependencies() {
@@ -314,7 +238,7 @@ get_public_ip() {
     return 1
 }
 
-# ==================== Cloudflare 专用模块 (纯 Shell 物理隔离) ====================
+# ==================== Cloudflare 专用模块 ====================
 cf_api() {
     local method="$1"
     local endpoint="$2"
@@ -423,7 +347,7 @@ EOF
     return 0
 }
 
-# ==================== 华为云 专用模块 (按需调用 Python3 签名) ====================
+# ==================== 华为云 专用模块 ====================
 hw_api() {
     local method="$1"
     local uri="$2"
@@ -640,7 +564,7 @@ configure_ddns() {
     fi
 }
 
-# ==================== 二级菜单：按需修改现有配置 ====================
+# ==================== 二级菜单：修改现有配置 ====================
 modify_config_menu() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "\n${RED}未检测到配置文件，请先选择 [1] 完成初次配置！${RESET}"
@@ -673,18 +597,18 @@ modify_config_menu() {
                 1)
                     read -rp "请输入新的 AK: " new_ak
                     new_ak=$(echo "$new_ak" | tr -d '[:space:]')
-                    [ -z "$new_ak" ] && echo -e "${RED}AK 不能为空，已取消修改！${RESET}" || verify_and_save_hw "$new_ak" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
+                    [ -z "$new_ak" ] && echo -e "${RED}AK 不能为空！${RESET}" || verify_and_save_hw "$new_ak" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
                     pause_return ;;
                 2)
                     read -rp "请输入新的 SK: " new_sk
                     new_sk=$(echo "$new_sk" | tr -d '[:space:]')
-                    [ -z "$new_sk" ] && echo -e "${RED}SK 不能为空，已取消修改！${RESET}" || verify_and_save_hw "$HW_AK" "$new_sk" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
+                    [ -z "$new_sk" ] && echo -e "${RED}SK 不能为空！${RESET}" || verify_and_save_hw "$HW_AK" "$new_sk" "$RECORD_NAME" "$RECORD_TYPE" "$HW_TTL"
                     pause_return ;;
                 3)
                     read -rp "请输入新的域名: " new_domain
                     new_domain=$(echo "$new_domain" | tr -d '[:space:]')
                     new_domain="${new_domain%.}"
-                    [ -z "$new_domain" ] && echo -e "${RED}域名不能为空，已取消修改！${RESET}" || verify_and_save_hw "$HW_AK" "$HW_SK" "$new_domain" "$RECORD_TYPE" "$HW_TTL"
+                    [ -z "$new_domain" ] && echo -e "${RED}域名不能为空！${RESET}" || verify_and_save_hw "$HW_AK" "$HW_SK" "$new_domain" "$RECORD_TYPE" "$HW_TTL"
                     pause_return ;;
                 4)
                     read -rp "请选择解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_c
@@ -693,7 +617,7 @@ modify_config_menu() {
                     elif [ "$new_type_c" = "2" ]; then
                         verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "AAAA" "$HW_TTL"
                     else
-                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        echo -e "${RED}输入无效！${RESET}"
                     fi
                     pause_return ;;
                 5)
@@ -704,7 +628,7 @@ modify_config_menu() {
                     verify_and_save_hw "$HW_AK" "$HW_SK" "$RECORD_NAME" "$RECORD_TYPE" "$new_ttl"
                     pause_return ;;
                 0) break ;;
-                *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+                *) echo -e "${RED}无效选项！${RESET}"; pause_return ;;
             esac
         else
             local proxy_str="${YELLOW}关闭 (false)${RESET}"
@@ -724,18 +648,18 @@ modify_config_menu() {
                 1)
                     read -rp "请输入新的 CF 邮箱: " new_email
                     new_email=$(echo "$new_email" | tr -d '[:space:]')
-                    [ -z "$new_email" ] && echo -e "${RED}邮箱不能为空，已取消修改！${RESET}" || verify_and_save_cf "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
+                    [ -z "$new_email" ] && echo -e "${RED}邮箱不能为空！${RESET}" || verify_and_save_cf "$new_email" "$RECORD_NAME" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
                     pause_return ;;
                 2)
                     read -rp "请输入新的域名: " new_domain
                     new_domain=$(echo "$new_domain" | tr -d '[:space:]')
                     new_domain="${new_domain%.}"
-                    [ -z "$new_domain" ] && echo -e "${RED}域名不能为空，已取消修改！${RESET}" || verify_and_save_cf "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
+                    [ -z "$new_domain" ] && echo -e "${RED}域名不能为空！${RESET}" || verify_and_save_cf "$CF_EMAIL" "$new_domain" "$CF_TOKEN" "$RECORD_TYPE" "$PROXIED"
                     pause_return ;;
                 3)
                     read -rp "请输入新的 Token: " new_token
                     new_token=$(echo "$new_token" | tr -d '[:space:]')
-                    [ -z "$new_token" ] && echo -e "${RED}Token 不能为空，已取消修改！${RESET}" || verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
+                    [ -z "$new_token" ] && echo -e "${RED}Token 不能为空！${RESET}" || verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$new_token" "$RECORD_TYPE" "$PROXIED"
                     pause_return ;;
                 4)
                     read -rp "请选择解析类型 [1: IPv4(A) / 2: IPv6(AAAA)]: " new_type_c
@@ -744,7 +668,7 @@ modify_config_menu() {
                     elif [ "$new_type_c" = "2" ]; then
                         verify_and_save_cf "$CF_EMAIL" "$RECORD_NAME" "$CF_TOKEN" "AAAA" "$PROXIED"
                     else
-                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        echo -e "${RED}输入无效！${RESET}"
                     fi
                     pause_return ;;
                 5)
@@ -755,7 +679,7 @@ modify_config_menu() {
                     elif [ "$new_proxy_c" = "2" ]; then
                         new_p="true"
                     else
-                        echo -e "${RED}输入无效，已取消修改！${RESET}"
+                        echo -e "${RED}输入无效！${RESET}"
                         pause_return
                         continue
                     fi
@@ -766,7 +690,7 @@ modify_config_menu() {
                     wakeup_daemon
                     pause_return ;;
                 0) break ;;
-                *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+                *) echo -e "${RED}无效选项！${RESET}"; pause_return ;;
             esac
         fi
     done
@@ -937,7 +861,7 @@ stop_timer() {
         rm -f "$PID_FILE"
     fi
 
-    pkill -f "cf-ddns.sh --daemon" 2>/dev/null || true
+    pkill -f "${SCRIPT_PATH} --daemon" 2>/dev/null || true
     crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH" | crontab - 2>/dev/null || true
     [ "$quiet" != "quiet" ] && echo -e "${GREEN}已停止后台 DDNS 定时任务。${RESET}"
 }
@@ -967,9 +891,6 @@ setup_timer() {
             ;;
     esac
 
-    # 将内存中的完整脚本持久化写入固定路径 $CONFIG_DIR/cf-ddns.sh
-    persist_self
-
     echo "$interval" > "$INTERVAL_FILE"
     stop_timer "quiet"
 
@@ -984,7 +905,7 @@ Wants=network-online.target
 Type=simple
 Environment="HOME=${HOME}"
 Environment="CONFIG_DIR=${CONFIG_DIR}"
-ExecStart=/usr/bin/env bash "${SCRIPT_PATH}" --daemon ${interval}
+ExecStart=/usr/bin/env bash ${SCRIPT_PATH} --daemon ${interval}
 Restart=always
 RestartSec=5
 
@@ -993,17 +914,15 @@ WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable --now cf-ddns.service >/dev/null 2>&1
-        sleep 0.3
         echo -e "${GREEN}后台定时任务已启动 (Systemd 服务，支持开机自启)！检测间隔：每 ${interval} 秒。${RESET}"
     else
         nohup env HOME="$HOME" CONFIG_DIR="$CONFIG_DIR" /usr/bin/env bash "$SCRIPT_PATH" --daemon "$interval" >/dev/null 2>&1 &
-        (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH"; echo "@reboot env HOME=\"$HOME\" CONFIG_DIR=\"$CONFIG_DIR\" nohup /usr/bin/env bash \"${SCRIPT_PATH}\" --daemon ${interval} >/dev/null 2>&1 &") | crontab - 2>/dev/null
-        sleep 0.3
+        (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH"; echo "@reboot env HOME=\"$HOME\" CONFIG_DIR=\"$CONFIG_DIR\" nohup /usr/bin/env bash ${SCRIPT_PATH} --daemon ${interval} >/dev/null 2>&1 &") | crontab - 2>/dev/null
         echo -e "${GREEN}后台定时任务已启动 (Nohup 守护进程)！检测间隔：每 ${interval} 秒。${RESET}"
     fi
 }
 
-# 查看当前状态与日志
+# ==================== 状态展示修复 ====================
 show_status() {
     echo -e "\n${CYAN}--- 当前配置与运行状态 ---${RESET}"
     if [ -f "$CONFIG_FILE" ]; then
@@ -1032,31 +951,23 @@ show_status() {
         [ -n "$tmp_int" ] && cur_interval="$tmp_int"
     fi
 
+    # 双重状态判断：优先检查 Systemd 服务真实状态，兜底检查本地 PID/进程
     local is_running=false
     local run_pid=""
 
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet cf-ddns.service 2>/dev/null; then
         is_running=true
         run_pid=$(systemctl show -p MainPID --value cf-ddns.service 2>/dev/null)
-        [ "$run_pid" = "0" ] && run_pid=""
-    fi
-
-    if [ "$is_running" = false ] && [ -f "$PID_FILE" ]; then
-        local f_pid
-        f_pid=$(tr -cd '0-9' < "$PID_FILE")
-        if [ -n "$f_pid" ] && kill -0 "$f_pid" 2>/dev/null; then
-            is_running=true
-            run_pid="$f_pid"
-        fi
-    fi
-
-    if [ "$is_running" = false ]; then
-        run_pid=$(pgrep -f "cf-ddns.sh --daemon" 2>/dev/null | head -n 1)
+    elif [ -f "$PID_FILE" ] && kill -0 "$(tr -cd '0-9' < "$PID_FILE")" 2>/dev/null; then
+        is_running=true
+        run_pid=$(tr -cd '0-9' < "$PID_FILE")
+    else
+        run_pid=$(pgrep -f "${SCRIPT_PATH}.*--daemon" 2>/dev/null | head -n 1)
         [ -n "$run_pid" ] && is_running=true
     fi
 
     if [ "$is_running" = true ]; then
-        echo -e "定时状态  : ${GREEN}后台运行中${RESET} (PID: ${run_pid:-守护进程} | 间隔: ${cur_interval} 秒)"
+        echo -e "定时状态  : ${GREEN}后台运行中${RESET} (PID: ${run_pid:-未知} | 间隔: ${cur_interval} 秒)"
     else
         echo -e "定时状态  : ${YELLOW}未运行${RESET}"
     fi
@@ -1074,19 +985,16 @@ uninstall_ddns() {
     echo -e "\n${RED}=================== 警告 ===================${RESET}"
     echo -e "${YELLOW}即将彻底卸载 DDNS 脚本！该操作将：${RESET}"
     echo "  1. 停止并移除后台定时任务与开机自启服务"
-    echo "  2. 删除所有配置文件、IP 缓存、守护脚本与运行日志 ($CONFIG_DIR)"
+    echo "  2. 删除所有配置文件、IP 缓存与运行日志 ($CONFIG_DIR)"
+    echo "  3. 删除当前脚本文件自身 ($SCRIPT_PATH)"
     echo -e "${RED}============================================${RESET}"
     read -rp "确认要彻底卸载吗？[y/N]: " confirm_uninst
 
     case "$confirm_uninst" in
         [yY][eE][sS]|[yY])
             stop_timer "quiet"
-            local caller_script=""
-            if [ -f "$0" ] && [[ "$0" != *"/dev/fd/"* ]] && [[ "$0" != *"/proc/"* ]]; then
-                caller_script="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/$(basename "$0")"
-            fi
             rm -rf "$CONFIG_DIR"
-            [ -n "$caller_script" ] && rm -f "$caller_script" 2>/dev/null
+            rm -f "$SCRIPT_PATH"
             echo -e "${GREEN}卸载完成！所有服务、配置及脚本自身已彻底清除。${RESET}"
             exit 0
             ;;
@@ -1096,44 +1004,40 @@ uninstall_ddns() {
     esac
 }
 
-# 主交互菜单函数
-main_menu() {
-    ensure_dependencies "curl"
-    persist_self
-
-    while true; do
-        echo -e "\n${CYAN}=========================================${RESET}"
-        echo -e "${CYAN}     多平台轻量级 DDNS 管理脚本          ${RESET}"
-        echo -e "${CYAN}=========================================${RESET}"
-        echo "  1. 初次配置 DDNS (Cloudflare / 华为云)"
-        echo "  2. 修改现有配置 (二级菜单单项修改)"
-        echo "  3. 立即执行一次 DDNS 同步 (测试/强制刷新)"
-        echo "  4. 开启 / 修改后台定时任务 (按秒设置)"
-        echo "  5. 停止后台定时任务"
-        echo "  6. 查看当前状态与运行日志"
-        echo "  7. 彻底卸载脚本 (停止服务并清除所有文件)"
-        echo "  0. 退出脚本"
-        echo -e "${CYAN}=========================================${RESET}"
-        read -rp "请输入数字选择功能 [0-7]: " choice
-
-        case "$choice" in
-            1) configure_ddns; pause_return ;;
-            2) modify_config_menu ;;
-            3) update_ddns "interactive"; pause_return ;;
-            4) setup_timer; pause_return ;;
-            5) stop_timer; pause_return ;;
-            6) show_status; pause_return ;;
-            7) uninstall_ddns; pause_return ;;
-            0) echo "已退出。"; exit 0 ;;
-            *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
-        esac
-    done
-}
-
-# 入口路由
-if [ "${1:-}" = "--daemon" ]; then
-    run_daemon "${2:-}"
+# 后台守护调用入口
+if [ "$1" = "--daemon" ]; then
+    run_daemon "$2"
     exit 0
 fi
 
-main_menu "$@"
+# 启动仅检查基础轻量依赖 curl (不预装 python3，保持 Cloudflare 模式超轻量)
+ensure_dependencies "curl"
+
+# 主交互菜单
+while true; do
+    echo -e "\n${CYAN}=========================================${RESET}"
+    echo -e "${CYAN}     多平台轻量级 DDNS 管理脚本          ${RESET}"
+    echo -e "${CYAN}=========================================${RESET}"
+    echo "  1. 初次配置 DDNS (Cloudflare / 华为云)"
+    echo "  2. 修改现有配置 (二级菜单单项修改)"
+    echo "  3. 立即执行一次 DDNS 同步 (测试/强制刷新)"
+    echo "  4. 开启 / 修改后台定时任务 (按秒设置)"
+    echo "  5. 停止后台定时任务"
+    echo "  6. 查看当前状态与运行日志"
+    echo "  7. 彻底卸载脚本 (停止服务并清除所有文件)"
+    echo "  0. 退出脚本"
+    echo -e "${CYAN}=========================================${RESET}"
+    read -rp "请输入数字选择功能 [0-7]: " choice
+
+    case "$choice" in
+        1) configure_ddns; pause_return ;;
+        2) modify_config_menu ;;
+        3) update_ddns "interactive"; pause_return ;;
+        4) setup_timer; pause_return ;;
+        5) stop_timer; pause_return ;;
+        6) show_status; pause_return ;;
+        7) uninstall_ddns; pause_return ;;
+        0) echo "已退出。"; exit 0 ;;
+        *) echo -e "${RED}无效选项，请重新输入！${RESET}"; pause_return ;;
+    esac
+done
